@@ -143,8 +143,8 @@ bash <(curl -fsSL https://github.com/vectrify/vectrify-agent-runner/releases/lat
 ```
 
 ```powershell
-# Windows — from an Administrator PowerShell
-iwr -useb https://github.com/vectrify/vectrify-agent-runner/releases/latest/download/install.ps1 | iex
+# Windows — works from any PowerShell window (prompts for UAC automatically)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $f = "$env:TEMP\vectrify-install.ps1"; iwr -useb https://github.com/kevin4885/vectrify-agent-runner/releases/latest/download/install.ps1 -OutFile $f; Start-Process powershell -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$f`"" -Wait; Remove-Item $f -EA 0
 ```
 
 ### Local install (after running build.ps1)

@@ -1,182 +1,134 @@
 # install.ps1 - Install Vectrify Agent Runner as a Windows Service
 #
-# Run from an Administrator PowerShell — either directly or via the one-liner:
-#   iwr -useb https://github.com/vectrify/vectrify-agent-runner/releases/latest/download/install.ps1 | iex
-#
-# Usage:
-#   .\install.ps1
+# One-liner (run from an Administrator PowerShell):
+#   iwr -useb https://github.com/kevin4885/vectrify-agent-runner/releases/latest/download/install.ps1 | iex
 
-$GITHUB_REPO = "kevin4885/vectrify-agent-runner"
-
-# Force TLS 1.2 — Windows PowerShell 5 defaults to TLS 1.0 which GitHub rejects.
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# ── Administrator check ───────────────────────────────────────────────────────
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+function Install-VectrifyRunner {
 
-if (-not $isAdmin) {
+    $GITHUB_REPO    = "kevin4885/vectrify-agent-runner"
+    $ServiceName    = "VectrifyRunner"
+    $ServiceDisplay = "Vectrify Agent Runner"
+    $InstallDir     = "C:\Program Files\VectrifyRunner"
+    $ConfigDir      = "C:\ProgramData\VectrifyRunner"
+    $ConfigFile     = "$ConfigDir\config.yaml"
+    $ExeDest        = "$InstallDir\vectrify-runner.exe"
+
+    # ── Admin check ───────────────────────────────────────────────────────────
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Host ""
+        Write-Host "  ERROR: Run from an Administrator PowerShell." -ForegroundColor Red
+        Write-Host "  Right-click PowerShell -> Run as administrator, then try again." -ForegroundColor Yellow
+        Write-Host ""
+        return
+    }
+
+    $ErrorActionPreference = "Stop"
+
     Write-Host ""
-    Write-Host "  ERROR: This installer must run as Administrator." -ForegroundColor Red
+    Write-Host "  Vectrify Agent Runner - Installer" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "  Open PowerShell as Administrator and run:" -ForegroundColor Yellow
-    Write-Host "  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iwr -useb https://github.com/$GITHUB_REPO/releases/latest/download/install.ps1 | iex" -ForegroundColor Cyan
+
+    # ── Locate or download binary ─────────────────────────────────────────────
+    $src = $null; $downloaded = $false
+    foreach ($c in @(".\vectrify-runner.exe", ".\dist\vectrify-runner-windows-amd64.exe")) {
+        if (Test-Path $c) { $src = (Resolve-Path $c).Path; break }
+    }
+    if (-not $src) {
+        $asset = "vectrify-runner-windows-amd64.exe"
+        $url   = "https://github.com/$GITHUB_REPO/releases/latest/download/$asset"
+        $tmp   = "$env:TEMP\vectrify-runner-$(Get-Random).exe"
+        Write-Host "  Downloading $asset..." -NoNewline
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+            $src = $tmp; $downloaded = $true
+            Write-Host " done" -ForegroundColor Green
+        } catch {
+            Write-Host " FAILED" -ForegroundColor Red
+            Write-Host "  $_" -ForegroundColor Red
+            return
+        }
+    }
+    Write-Host "  Binary : $src" -ForegroundColor DarkGray
     Write-Host ""
-    if ($PSCommandPath) { Read-Host "  Press Enter to exit" }
-    exit 1
-}
 
-$ErrorActionPreference = "Stop"
-
-$ServiceName = "VectrifyRunner"
-$ServiceDisplay = "Vectrify Agent Runner"
-$InstallDir  = "C:\Program Files\VectrifyRunner"
-$ConfigDir   = "C:\ProgramData\VectrifyRunner"
-$ConfigFile  = "$ConfigDir\config.yaml"
-$ExeName     = "vectrify-runner.exe"
-$ExeDest     = "$InstallDir\$ExeName"
-
-# ── Banner ────────────────────────────────────────────────────────────────────
-Write-Host ""
-Write-Host "  Vectrify Agent Runner - Windows Installer" -ForegroundColor Cyan
-Write-Host ""
-
-# ── Locate binary ─────────────────────────────────────────────────────────────
-$candidates = @(
-    ".\$ExeName",
-    ".\dist\vectrify-runner-windows-amd64.exe"
-)
-
-$src        = $null
-$downloaded = $false
-foreach ($c in $candidates) {
-    if (Test-Path $c) { $src = (Resolve-Path $c).Path; break }
-}
-
-if (-not $src) {
-    $asset       = "vectrify-runner-windows-amd64.exe"
-    $downloadUrl = "https://github.com/$GITHUB_REPO/releases/latest/download/$asset"
-    $tmpExe      = "$env:TEMP\vectrify-runner-$(Get-Random).exe"
-
-    Write-Host "  Downloading $asset..." -NoNewline
-    try {
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpExe -UseBasicParsing
-        $src        = $tmpExe
-        $downloaded = $true
-        Write-Host " done" -ForegroundColor Green
-    } catch {
-        Write-Host " FAILED" -ForegroundColor Red
-        Write-Host "  ERROR: $_" -ForegroundColor Red
-        Read-Host "  Press Enter to exit"
-        exit 1
+    # ── Prompt helpers ────────────────────────────────────────────────────────
+    function Ask-Required([string]$Label) {
+        while ($true) {
+            $v = (Read-Host "  $Label").Trim()
+            if ($v) { return $v }
+            Write-Host "  Required." -ForegroundColor Yellow
+        }
     }
-}
+    function Ask-Default([string]$Label, [string]$Def) {
+        $v = (Read-Host "  $Label [$Def]").Trim()
+        return $(if ($v) { $v } else { $Def })
+    }
+    function Ask-YesNo([string]$Label, [bool]$Def = $false) {
+        $hint = if ($Def) { "Y/n" } else { "y/N" }
+        while ($true) {
+            $v = (Read-Host "  $Label [$hint]").Trim().ToLower()
+            if ($v -eq "")  { return $Def }
+            if ($v -eq "y") { return $true }
+            if ($v -eq "n") { return $false }
+            Write-Host "  Enter Y or N." -ForegroundColor Yellow
+        }
+    }
+    function Ask-Choice([string]$Label, [string[]]$Choices, [string]$Def) {
+        $hint = $Choices -join " | "
+        while ($true) {
+            $v = (Read-Host "  $Label ($hint) [$Def]").Trim().ToLower()
+            if ($v -eq "") { return $Def }
+            if ($Choices -contains $v) { return $v }
+            Write-Host "  Choose: $hint" -ForegroundColor Yellow
+        }
+    }
 
-Write-Host "  Binary : $src" -ForegroundColor DarkGray
-Write-Host ""
+    # ── Collect config ────────────────────────────────────────────────────────
+    Write-Host "  Configure the runner:" -ForegroundColor White
+    Write-Host ""
 
-# ── Prompt helpers ────────────────────────────────────────────────────────────
-function Read-Required {
-    param([string]$Label)
     while ($true) {
-        $val = (Read-Host "  $Label").Trim()
-        if ($val -ne "") { return $val }
-        Write-Host "  This field is required." -ForegroundColor Yellow
+        $workspaceRoot = Ask-Required "Workspace root folder"
+        if (Test-Path $workspaceRoot -PathType Container) { break }
+        Write-Host "  Not found." -ForegroundColor Yellow
+        if (Ask-YesNo "Create it?" $false) { New-Item -ItemType Directory -Force $workspaceRoot | Out-Null; break }
     }
-}
-
-function Read-WithDefault {
-    param([string]$Label, [string]$Default)
-    $val = (Read-Host "  $Label [$Default]").Trim()
-    return $(if ($val -ne "") { $val } else { $Default })
-}
-
-function Read-YesNo {
-    param([string]$Label, [bool]$Default = $false)
-    $hint = if ($Default) { "Y/n" } else { "y/N" }
     while ($true) {
-        $val = (Read-Host "  $Label [$hint]").Trim().ToLower()
-        if ($val -eq "")  { return $Default }
-        if ($val -eq "y") { return $true    }
-        if ($val -eq "n") { return $false   }
-        Write-Host "  Please enter Y or N." -ForegroundColor Yellow
+        $runnerKey = Ask-Required "Runner key (vrun_...)"
+        if ($runnerKey -match '^vrun_.+') { break }
+        Write-Host "  Must start with vrun_" -ForegroundColor Yellow
     }
-}
-
-function Read-Choice {
-    param([string]$Label, [string[]]$Choices, [string]$Default)
-    $hint = $Choices -join " | "
+    $allowShell = Ask-YesNo  "Allow shell commands?" $false
+    $logLevel   = Ask-Choice "Log level" @("info","debug","warn","error") "info"
     while ($true) {
-        $val = (Read-Host "  $Label ($hint) [$Default]").Trim().ToLower()
-        if ($val -eq "") { return $Default }
-        if ($Choices -contains $val) { return $val }
-        Write-Host "  Choose one of: $hint" -ForegroundColor Yellow
+        $bs = Ask-Default "Max reconnect backoff seconds" "60"
+        if ($bs -match '^\d+$' -and [int]$bs -gt 0) { $backoff = [int]$bs; break }
+        Write-Host "  Must be a positive integer." -ForegroundColor Yellow
     }
-}
 
-# ── Collect configuration ─────────────────────────────────────────────────────
-Write-Host "  Configure the runner:" -ForegroundColor White
-Write-Host ""
+    $allowShellYaml = if ($allowShell) { "true" } else { "false" }
 
-# workspace_root
-while ($true) {
-    $workspaceRoot = Read-Required -Label "Workspace root folder path"
-    if (Test-Path $workspaceRoot -PathType Container) { break }
-    Write-Host "  Directory not found: $workspaceRoot" -ForegroundColor Yellow
-    $create = Read-YesNo -Label "Create it?" -Default $false
-    if ($create) { New-Item -ItemType Directory -Force $workspaceRoot | Out-Null; break }
-}
+    # ── Summary + confirm ─────────────────────────────────────────────────────
+    Write-Host ""
+    Write-Host "  workspace : $workspaceRoot"
+    Write-Host "  key       : $($runnerKey.Substring(0,[Math]::Min(8,$runnerKey.Length)))..."
+    Write-Host "  shell     : $allowShellYaml  |  log: $logLevel  |  backoff: ${backoff}s"
+    Write-Host ""
+    if (-not (Ask-YesNo "Proceed?" $true)) { if ($downloaded) { Remove-Item $src -EA 0 }; return }
+    Write-Host ""
 
-# runner_key
-while ($true) {
-    $runnerKey = Read-Required -Label "Runner key (vrun_...)"
-    if ($runnerKey -match '^vrun_.+') { break }
-    Write-Host "  Key must start with 'vrun_'" -ForegroundColor Yellow
-}
+    # ── Install ───────────────────────────────────────────────────────────────
+    Write-Host "  [1/5] Installing binary..."   -NoNewline
+    New-Item -ItemType Directory -Force $InstallDir | Out-Null
+    Copy-Item -Force $src $ExeDest
+    Write-Host " done" -ForegroundColor Green
 
-# allow_shell
-$allowShell = Read-YesNo -Label "Allow shell commands?" -Default $false
-
-# log_level
-$logLevel = Read-Choice -Label "Log level" -Choices @("info","debug","warn","error") -Default "info"
-
-# reconnect_max_backoff
-while ($true) {
-    $backoffStr = Read-WithDefault -Label "Max reconnect backoff in seconds" -Default "60"
-    if ($backoffStr -match '^\d+$' -and [int]$backoffStr -gt 0) { $backoff = [int]$backoffStr; break }
-    Write-Host "  Must be a positive integer." -ForegroundColor Yellow
-}
-
-$allowShellYaml = if ($allowShell) { "true" } else { "false" }
-$keyPreview     = $runnerKey.Substring(0, [Math]::Min(8, $runnerKey.Length)) + "..."
-
-# ── Summary ───────────────────────────────────────────────────────────────────
-Write-Host ""
-Write-Host "  ----------------------------------------" -ForegroundColor DarkGray
-Write-Host "  workspace_root : $workspaceRoot"
-Write-Host "  runner_key     : $keyPreview"
-Write-Host "  allow_shell    : $allowShellYaml"
-Write-Host "  log_level      : $logLevel"
-Write-Host "  backoff        : $backoff s"
-Write-Host "  install dir    : $InstallDir"
-Write-Host "  config file    : $ConfigFile"
-Write-Host "  ----------------------------------------" -ForegroundColor DarkGray
-Write-Host ""
-
-$proceed = Read-YesNo -Label "Proceed with install?" -Default $true
-if (-not $proceed) { Write-Host "  Aborted."; Write-Host ""; Read-Host "  Press Enter to exit"; exit 0 }
-Write-Host ""
-
-# ── Step 1: Install binary ────────────────────────────────────────────────────
-Write-Host "  [1/5] Installing binary..." -NoNewline
-New-Item -ItemType Directory -Force $InstallDir | Out-Null
-Copy-Item -Force $src $ExeDest
-Write-Host " done" -ForegroundColor Green
-
-# ── Step 2: Write config ──────────────────────────────────────────────────────
-Write-Host "  [2/5] Writing config..." -NoNewline
-New-Item -ItemType Directory -Force $ConfigDir | Out-Null
-
-@"
+    Write-Host "  [2/5] Writing config..."      -NoNewline
+    New-Item -ItemType Directory -Force $ConfigDir | Out-Null
+    @"
 api_url:               wss://api.vectrify.ai/api/v1/runner/ws
 runner_key:            $runnerKey
 workspace_root:        $workspaceRoot
@@ -184,52 +136,35 @@ allow_shell:           $allowShellYaml
 log_level:             $logLevel
 reconnect_max_backoff: $backoff
 "@ | Set-Content -Encoding UTF8 $ConfigFile
+    Write-Host " done" -ForegroundColor Green
 
-Write-Host " done" -ForegroundColor Green
-
-# ── Step 3: Remove old service if present ────────────────────────────────────
-Write-Host "  [3/5] Registering Windows Service..." -NoNewline
-$existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($existing) {
-    if ($existing.Status -eq "Running") {
-        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
+    Write-Host "  [3/5] Registering service..." -NoNewline
+    $svc = Get-Service $ServiceName -EA SilentlyContinue
+    if ($svc) {
+        if ($svc.Status -eq "Running") { Stop-Service $ServiceName -Force -EA 0; Start-Sleep 2 }
+        sc.exe delete $ServiceName | Out-Null; Start-Sleep 1
     }
-    sc.exe delete $ServiceName | Out-Null
-    Start-Sleep -Seconds 1
+    sc.exe create $ServiceName binPath= "`"$ExeDest`" --config `"$ConfigFile`"" start= auto obj= LocalSystem DisplayName= $ServiceDisplay | Out-Null
+    sc.exe description $ServiceName "Connects to Vectrify Cloud and executes agent commands on this machine." | Out-Null
+    Write-Host " done" -ForegroundColor Green
+
+    Write-Host "  [4/5] Restart-on-failure..."  -NoNewline
+    sc.exe failure $ServiceName reset= 3600 actions= restart/5000/restart/10000/restart/30000 | Out-Null
+    Write-Host " done" -ForegroundColor Green
+
+    Write-Host "  [5/5] Starting service..."    -NoNewline
+    Start-Service $ServiceName
+    Write-Host " done" -ForegroundColor Green
+
+    # ── Done ──────────────────────────────────────────────────────────────────
+    Write-Host ""
+    $st = (Get-Service $ServiceName).Status
+    Write-Host "  $ServiceName : $st" -ForegroundColor $(if ($st -eq "Running") { "Green" } else { "Yellow" })
+    Write-Host ""
+    Write-Host "  Done!" -ForegroundColor Cyan
+    Write-Host ""
+
+    if ($downloaded) { Remove-Item $src -EA 0 }
 }
 
-$binPathArg = "`"$ExeDest`" --config `"$ConfigFile`""
-sc.exe create $ServiceName binPath= $binPathArg start= auto obj= LocalSystem DisplayName= $ServiceDisplay | Out-Null
-sc.exe description $ServiceName "Connects to Vectrify Cloud and executes agent commands on this machine." | Out-Null
-Write-Host " done" -ForegroundColor Green
-
-# ── Step 4: Configure restart-on-failure ─────────────────────────────────────
-Write-Host "  [4/5] Configuring restart-on-failure..." -NoNewline
-sc.exe failure $ServiceName reset= 3600 actions= restart/5000/restart/10000/restart/30000 | Out-Null
-Write-Host " done" -ForegroundColor Green
-
-# ── Step 5: Start service ─────────────────────────────────────────────────────
-Write-Host "  [5/5] Starting service..." -NoNewline
-Start-Service -Name $ServiceName
-Write-Host " done" -ForegroundColor Green
-
-# ── Result ────────────────────────────────────────────────────────────────────
-Write-Host ""
-$status = (Get-Service -Name $ServiceName).Status
-$color  = if ($status -eq "Running") { "Green" } else { "Yellow" }
-Write-Host "  Service status : $status" -ForegroundColor $color
-Write-Host ""
-Write-Host "  Install complete!" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "  Manage the service with:"
-Write-Host "    Start-Service   $ServiceName"
-Write-Host "    Stop-Service    $ServiceName"
-Write-Host "    Restart-Service $ServiceName"
-Write-Host "    Get-Service     $ServiceName"
-Write-Host ""
-
-# Clean up temp download if applicable.
-if ($downloaded) { Remove-Item $src -ErrorAction SilentlyContinue }
-
-Read-Host "  Press Enter to exit"
+Install-VectrifyRunner
