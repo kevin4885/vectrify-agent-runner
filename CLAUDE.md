@@ -28,8 +28,16 @@ Vectrify Cloud (AWS)                    Customer Machine
 
 ```
 vectrify-agent-runner/
-├── main.go                Entry point — loads config, sets up logger, starts RunForever loop
+├── main.go                Entry point — loads config, sets up logger, calls runService()
+├── service_windows.go     Windows Service handler (build tag: windows) — svc.Handler impl,
+│                          detects SCM vs interactive mode via svc.IsWindowsService()
+├── service_other.go       Linux/macOS stub (build tag: !windows) — delegates to runInteractive()
 ├── go.mod                 Go module definition (vectrify/agent-runner)
+├── build.ps1              Cross-compile all 5 platform binaries into dist/ (run from Windows)
+├── install.ps1            Interactive Windows installer — prompts for config, installs as
+│                          Windows Service via sc.exe (C:\ProgramData\VectrifyRunner\config.yaml)
+├── install.sh             Interactive Linux/macOS installer — prompts for config, installs as
+│                          systemd service (Linux) or launchd daemon (macOS)
 ├── CLAUDE.md              This file
 ├── README.md              User-facing installation guide
 ├── config/
@@ -55,6 +63,7 @@ vectrify-agent-runner/
 | WebSocket | gorilla/websocket v1.5.3 |
 | Config | gopkg.in/yaml.v3 |
 | Logging | log/slog (stdlib, structured JSON/text) |
+| Windows Service | golang.org/x/sys/windows/svc |
 | Shell (Linux/macOS) | bash -c "..." |
 | Shell (Windows) | powershell -NoProfile -NonInteractive -Command "..." |
 
@@ -113,15 +122,60 @@ reconnect_max_backoff: 60               # seconds
 
 ## Building
 
-```bash
-# Local build
-go build -o vectrify-runner ./...
+```powershell
+# Build all 5 platform binaries into dist/ (from Windows)
+.\build.ps1
 
-# Cross-compile for all platforms
-GOOS=linux   GOARCH=amd64   go build -ldflags "-X vectrify/agent-runner/config.Version=1.0.0" -o dist/vectrify-runner-linux-amd64 ./...
-GOOS=darwin  GOARCH=arm64   go build -ldflags "-X vectrify/agent-runner/config.Version=1.0.0" -o dist/vectrify-runner-darwin-arm64 ./...
-GOOS=windows GOARCH=amd64   go build -ldflags "-X vectrify/agent-runner/config.Version=1.0.0" -o dist/vectrify-runner-windows-amd64.exe ./...
+# Build with a specific version
+.\build.ps1 -Version 1.2.3
+
+# Local build only (current platform)
+go build -o vectrify-runner.exe .
 ```
+
+## Installing
+
+### One-liner (recommended — downloads binary automatically from latest release)
+
+```bash
+# macOS / Linux
+bash <(curl -fsSL https://github.com/vectrify/vectrify-agent-runner/releases/latest/download/install.sh)
+```
+
+```powershell
+# Windows — from an Administrator PowerShell
+iwr -useb https://github.com/vectrify/vectrify-agent-runner/releases/latest/download/install.ps1 | iex
+```
+
+### Local install (after running build.ps1)
+
+```powershell
+# Windows
+.\install.ps1
+```
+
+```bash
+# Linux / macOS
+sudo ./install.sh
+```
+
+Both installers prompt for: workspace root path, runner key, allow_shell, log_level,
+and reconnect_max_backoff. Config is written to:
+- Windows : C:\ProgramData\VectrifyRunner\config.yaml
+- Linux   : /etc/vectrify-runner/config.yaml
+- macOS   : /etc/vectrify-runner/config.yaml
+
+## Releasing
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+GitHub Actions (`.github/workflows/release.yml`) triggers automatically, builds all
+5 platform binaries, and publishes them along with `install.sh` and `install.ps1`
+as assets on the GitHub Release. The one-liner install commands always pull from
+`releases/latest/download/` so users get the newest version automatically.
 
 ---
 
@@ -137,21 +191,17 @@ GOOS=windows GOARCH=amd64   go build -ldflags "-X vectrify/agent-runner/config.V
 
 ## Running as a system service
 
-### Linux (systemd)
-```ini
-[Unit]
-Description=Vectrify Agent Runner
-After=network.target
+Use `install.ps1` (Windows) or `install.sh` (Linux/macOS) — they handle everything.
 
-[Service]
-ExecStart=/usr/local/bin/vectrify-runner
-Restart=always
-RestartSec=5
-User=youruser
+### Service lifecycle (Windows)
 
-[Install]
-WantedBy=multi-user.target
-```
+The binary uses `golang.org/x/sys/windows/svc` to detect whether it was launched
+by the Windows SCM. When running as a service, `service_windows.go` implements
+`svc.Handler` and handles `SERVICE_CONTROL_STOP` / `SHUTDOWN`. When running
+interactively in a terminal, it falls back to SIGTERM/SIGINT handling as before.
 
-### macOS (launchd) — coming soon
-### Windows (service) — coming soon
+### Service lifecycle (Linux / macOS)
+
+`service_other.go` is a no-op stub — systemd and launchd both stop services by
+sending SIGTERM, which `runInteractive()` in `main.go` already handles correctly.
+No extra service-awareness is needed in the binary on these platforms.

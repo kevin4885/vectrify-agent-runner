@@ -64,7 +64,14 @@ func main() {
 		"allow_shell",    cfg.AllowShell,
 	)
 
-	// Graceful shutdown on SIGTERM / SIGINT
+	r := runner.New(cfg.WorkspaceRoot, log)
+	c := client.New(cfg, r, log)
+	runService(log, c)
+}
+
+// runInteractive runs the client with OS signal handling for graceful shutdown.
+// Used on all platforms when running directly in a terminal (not as a service daemon).
+func runInteractive(log *slog.Logger, c *client.Client) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
@@ -72,8 +79,5 @@ func main() {
 		log.Info("received signal, shutting down", "signal", sig)
 		os.Exit(0)
 	}()
-
-	r := runner.New(cfg.WorkspaceRoot, log)
-	c := client.New(cfg, r, log)
 	c.RunForever()
 }
