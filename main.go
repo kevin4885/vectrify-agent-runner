@@ -57,6 +57,9 @@ func main() {
 	case "error":
 		logLevel = slog.LevelError
 	}
+	if cfg.LogFile == "" {
+		cfg.LogFile = defaultLogFile()
+	}
 	var logWriter io.Writer = os.Stdout
 	if cfg.LogFile != "" {
 		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)

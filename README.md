@@ -10,337 +10,179 @@ The runner makes a **single outbound WebSocket connection** to the Vectrify API.
 
 ---
 
-## Requirements
+## Installation
 
-| Requirement | Notes |
-|---|---|
-| **Go 1.22+** | Only needed to build from source. Download from [go.dev/dl](https://go.dev/dl/) |
-| **Git** | Must be on `PATH`. Required for `runner_git` operations. |
-| **bash** (Linux/macOS) or **PowerShell** (Windows) | Required only if `allow_shell: true` |
-| Network access to `api.vectrify.ai` | Outbound HTTPS/WSS on port 443 |
-
----
-
-## Quickstart
-
-### Step 1 — Install Go (if you don't have it)
-
-**macOS / Linux:**
-```bash
-# macOS with Homebrew
-brew install go
-
-# Linux — download and extract
-wget https://go.dev/dl/go1.22.5.linux-amd64.tar.gz
-sudo tar -C /usr/local -xzf go1.22.5.linux-amd64.tar.gz
-export PATH=$PATH:/usr/local/go/bin   # add to ~/.bashrc or ~/.zshrc
-```
-
-**Windows (PowerShell):**
-```powershell
-# With winget
-winget install GoLang.Go
-
-# Or download the MSI from https://go.dev/dl/ and run the installer.
-# Then open a new terminal — go should be on PATH automatically.
-```
-
-Verify: `go version`
-
----
-
-### Step 2 — Clone and build
-
-**Linux / macOS:**
-```bash
-git clone https://github.com/vectrify/vectrify-agent-runner.git
-cd vectrify-agent-runner
-go mod tidy
-go build -o vectrify-runner .
-```
-
-**Windows (PowerShell):**
-```powershell
-git clone https://github.com/vectrify/vectrify-agent-runner.git
-cd vectrify-agent-runner
-go mod tidy
-go build -o vectrify-runner.exe .
-```
-
----
-
-### Step 3 — Register a runner in the Vectrify UI
+### Step 1 — Register a runner in the Vectrify UI
 
 1. Go to **Settings → Runners → New Runner**
 2. Give it a name (e.g. `dev-laptop`, `staging-server`)
 3. Copy the `vrun_...` key — it is shown **exactly once and never again**
 
+### Step 2 — Run the one-line installer
+
+**macOS / Linux:**
+```bash
+bash <(curl -fsSL https://github.com/kevin4885/vectrify-agent-runner/releases/latest/download/install.sh)
+```
+
+**Windows — open PowerShell as Administrator, then:**
+```powershell
+iwr -useb https://github.com/kevin4885/vectrify-agent-runner/releases/latest/download/install.ps1 | iex
+```
+
+The installer will ask for:
+- **Workspace root folder** — the directory agents are allowed to work in (all file operations are confined here)
+- **Runner key** — the `vrun_...` key from Step 1
+- **Allow shell commands** — whether to permit `runner_shell` commands (default: no)
+
+It then installs the binary, writes the config, and registers and starts a system service automatically.
+
+### What gets installed
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| Binary | `C:\Program Files\VectrifyRunner\vectrify-runner.exe` | `/usr/local/bin/vectrify-runner` | `/usr/local/bin/vectrify-runner` |
+| Config | `C:\ProgramData\VectrifyRunner\config.yaml` | `/etc/vectrify-runner/config.yaml` | `/etc/vectrify-runner/config.yaml` |
+| Logs | `C:\ProgramData\VectrifyRunner\vectrify-runner.log` | `journalctl -u vectrify-runner` | `/var/log/vectrify-runner.log` |
+| Service | Windows Service (`VectrifyRunner`) | systemd (`vectrify-runner`) | launchd (`ai.vectrify.runner`) |
+
 ---
 
-### Step 4 — Create the config file
+## Updating
 
-**Linux / macOS:**
-```bash
-mkdir -p ~/.vectrify-runner
-cat > ~/.vectrify-runner/config.yaml << 'EOF'
-api_url:        wss://api.vectrify.ai/api/v1/runner/ws
-runner_key:     vrun_YOUR_KEY_HERE
-workspace_root: /home/yourname/projects
-allow_shell:    false
-EOF
-```
+Re-run the same one-liner. If a config file already exists the installer detects it, skips all prompts, and just swaps the binary and restarts the service.
 
-**Windows (PowerShell):**
-```powershell
-New-Item -ItemType Directory -Force "$env:USERPROFILE\.vectrify-runner"
-@"
-api_url:        wss://api.vectrify.ai/api/v1/runner/ws
-runner_key:     vrun_YOUR_KEY_HERE
-workspace_root: C:\Users\yourname\projects
-allow_shell:    false
-"@ | Set-Content "$env:USERPROFILE\.vectrify-runner\config.yaml"
-```
-
-> **workspace_root** must be an absolute path. All file operations are confined to this directory — the runner rejects any path that tries to escape it.
+The runner also **updates itself automatically** — on startup and every 24 hours it checks GitHub for a newer release and applies it in the background with no user interaction needed.
 
 ---
 
-### Step 5 — Run
+## Managing the service
 
-**Linux / macOS:**
-```bash
-./vectrify-runner
-```
-
-**Windows:**
+### Windows
 ```powershell
-.\vectrify-runner.exe
+Start-Service   VectrifyRunner
+Stop-Service    VectrifyRunner
+Restart-Service VectrifyRunner
+Get-Service     VectrifyRunner
+
+# View logs
+Get-Content "C:\ProgramData\VectrifyRunner\vectrify-runner.log" -Wait
 ```
 
-You should see output like:
-```
-time=2026-05-07T14:00:00Z level=INFO msg="vectrify agent runner starting" version=dev platform=linux workspace_root=/home/yourname/projects allow_shell=false
-time=2026-05-07T14:00:01Z level=INFO msg=connecting url=wss://api.vectrify.ai/api/v1/runner/ws attempt=1
-time=2026-05-07T14:00:01Z level=INFO msg=registered runner_id=42
+### Linux
+```bash
+sudo systemctl start   vectrify-runner
+sudo systemctl stop    vectrify-runner
+sudo systemctl restart vectrify-runner
+sudo systemctl status  vectrify-runner
+
+# View logs
+journalctl -u vectrify-runner -f
 ```
 
-The runner will reconnect automatically if the connection drops.
+### macOS
+```bash
+sudo launchctl start  ai.vectrify.runner
+sudo launchctl stop   ai.vectrify.runner
+
+# View logs
+tail -f /var/log/vectrify-runner.log
+```
 
 ---
 
 ## Configuration reference
 
-The config file defaults to `~/.vectrify-runner/config.yaml` on all platforms.  Use `--config /path/to/config.yaml` to point to a different file.
+Config is written by the installer. To change a setting, edit the file and restart the service.
 
 | Key | Required | Default | Description |
 |---|---|---|---|
 | `api_url` | ✓ | — | WebSocket URL, e.g. `wss://api.vectrify.ai/api/v1/runner/ws` |
 | `runner_key` | ✓ | — | The `vrun_...` key from the Vectrify UI |
 | `workspace_root` | ✓ | — | Absolute path — all file operations must stay inside this directory |
-| `allow_shell` | | `false` | Set `true` to enable `runner_shell` commands (bash on Linux/macOS, PowerShell on Windows) |
+| `allow_shell` | | `false` | Set `true` to enable shell commands (bash on Linux/macOS, PowerShell on Windows) |
 | `log_level` | | `info` | Verbosity: `debug` \| `info` \| `warn` \| `error` |
-| `reconnect_max_backoff` | | `60` | Maximum seconds between reconnect attempts (uses exponential backoff) |
+| `reconnect_max_backoff` | | `60` | Maximum seconds between reconnect attempts (exponential backoff) |
+| `log_file` | | *(auto on Windows service)* | Path to write logs. Set automatically on Windows; on Linux/macOS the service manager captures stdout. |
 
----
-
-## Command-line flags
-
-```
-vectrify-runner [--config /path/to/config.yaml]
-```
+### Command-line flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--config` | `~/.vectrify-runner/config.yaml` | Path to the YAML config file |
+| `--config` | platform default | Path to the YAML config file |
 
 ---
 
-## Building for distribution (cross-compilation)
+## Development
 
-Go makes it trivial to build a single binary for any platform from any machine.
-Use `-ldflags` to stamp the version into the binary.
-
-```bash
-# From any OS — set GOOS and GOARCH to target platform
-
-# Linux (64-bit Intel/AMD)
-GOOS=linux   GOARCH=amd64   go build -ldflags "-X vectrify/agent-runner/config.Version=1.0.0" -o dist/vectrify-runner-linux-amd64 .
-
-# Linux (ARM64 — e.g. AWS Graviton, Raspberry Pi 4)
-GOOS=linux   GOARCH=arm64   go build -ldflags "-X vectrify/agent-runner/config.Version=1.0.0" -o dist/vectrify-runner-linux-arm64 .
-
-# macOS (Apple Silicon M1/M2/M3)
-GOOS=darwin  GOARCH=arm64   go build -ldflags "-X vectrify/agent-runner/config.Version=1.0.0" -o dist/vectrify-runner-darwin-arm64 .
-
-# macOS (Intel)
-GOOS=darwin  GOARCH=amd64   go build -ldflags "-X vectrify/agent-runner/config.Version=1.0.0" -o dist/vectrify-runner-darwin-amd64 .
-
-# Windows (64-bit)
-GOOS=windows GOARCH=amd64   go build -ldflags "-X vectrify/agent-runner/config.Version=1.0.0" -o dist/vectrify-runner-windows-amd64.exe .
-```
-
-**From Windows PowerShell:**
-```powershell
-$env:GOOS = "linux"; $env:GOARCH = "amd64"
-go build -ldflags "-X vectrify/agent-runner/config.Version=1.0.0" -o dist/vectrify-runner-linux-amd64 .
-Remove-Item Env:\GOOS, Env:\GOARCH
-```
-
-The resulting binaries are fully self-contained — no Go runtime or any other dependency is needed on the target machine.
-
----
-
-## Running as a background service
-
-### Linux — systemd
-
-```bash
-# Copy binary
-sudo cp vectrify-runner /usr/local/bin/vectrify-runner
-sudo chmod +x /usr/local/bin/vectrify-runner
-
-# Create service file (replace 'youruser' with your actual username)
-sudo tee /etc/systemd/system/vectrify-runner.service << 'EOF'
-[Unit]
-Description=Vectrify Agent Runner
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/vectrify-runner
-Restart=always
-RestartSec=5
-User=youruser
-WorkingDirectory=/home/youruser
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable vectrify-runner
-sudo systemctl start  vectrify-runner
-
-# Check status
-sudo systemctl status vectrify-runner
-journalctl -u vectrify-runner -f
-```
-
-### macOS — launchd
-
-```bash
-cp vectrify-runner /usr/local/bin/vectrify-runner
-
-# Create plist (replace 'youruser' with your actual username)
-cat > ~/Library/LaunchAgents/ai.vectrify.runner.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>ai.vectrify.runner</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/vectrify-runner</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/vectrify-runner.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/vectrify-runner.log</string>
-</dict>
-</plist>
-EOF
-
-launchctl load ~/Library/LaunchAgents/ai.vectrify.runner.plist
-
-# Check status
-launchctl list | grep vectrify
-tail -f /tmp/vectrify-runner.log
-```
-
-### Windows — Task Scheduler (runs at login)
+### Run against a local API
 
 ```powershell
-# Copy binary somewhere permanent
-Copy-Item .\vectrify-runner.exe "C:\Program Files\VectrifyRunner\vectrify-runner.exe"
-
-# Register a scheduled task that starts at logon and restarts on failure
-$action  = New-ScheduledTaskAction -Execute "C:\Program Files\VectrifyRunner\vectrify-runner.exe"
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-$settings = New-ScheduledTaskSettingsSet -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask `
-    -TaskName "VectrifyRunner" `
-    -Action   $action `
-    -Trigger  $trigger `
-    -Settings $settings `
-    -RunLevel Limited `
-    -Force
-
-# Start it now without waiting for next login
-Start-ScheduledTask -TaskName "VectrifyRunner"
-
-# Check it's running
-Get-ScheduledTask -TaskName "VectrifyRunner" | Select-Object TaskName, State
+# Windows
+.\vectrify-runner.exe --config dev-config.yaml
 ```
 
----
-
-## Development workflow
-
-### Run locally against a dev API
-
 ```bash
-# Point to your local dev API
-cat > ~/.vectrify-runner/config.yaml << 'EOF'
+# Linux / macOS
+./vectrify-runner --config dev-config.yaml
+```
+
+With `dev-config.yaml`:
+```yaml
 api_url:        ws://localhost:11083/api/v1/runner/ws
 runner_key:     vrun_YOUR_KEY_HERE
 workspace_root: /home/yourname/projects
 allow_shell:    true
 log_level:      debug
-EOF
-
-./vectrify-runner
 ```
 
-### Run with a custom config path
+### Build all platform binaries
+
+Requires Go 1.22+. From Windows:
+```powershell
+.\build.ps1                  # builds to dist/, version 1.0.0
+.\build.ps1 -Version 1.2.3   # stamp a specific version
+```
+
+Outputs:
+```
+dist/vectrify-runner-windows-amd64.exe
+dist/vectrify-runner-linux-amd64
+dist/vectrify-runner-linux-arm64
+dist/vectrify-runner-darwin-amd64
+dist/vectrify-runner-darwin-arm64
+```
+
+### Release
 
 ```bash
-./vectrify-runner --config ./my-test-config.yaml
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
-### Rebuild and restart quickly
-
-```bash
-go build -o vectrify-runner . && ./vectrify-runner
-```
+GitHub Actions builds all 5 binaries and publishes them as a GitHub Release automatically. The auto-updater in every installed runner will pick up the new version within 24 hours.
 
 ---
 
 ## Troubleshooting
 
 **`runner_key must start with 'vrun_'`**
-The key in config.yaml must start with `vrun_`. Re-copy it from the Vectrify UI.
+Re-copy the key from Settings → Runners in the Vectrify UI.
 
 **`Unauthorized` on connect**
-The key may have been deleted or the runner was deactivated in the Vectrify UI. Create a new runner and update the key in your config.
+The key was deleted or the runner was deactivated. Create a new runner and update `runner_key` in the config file.
 
 **`path is outside the workspace root`**
-The AI agent tried to access a file outside `workspace_root`. Check the path and ensure `workspace_root` covers the project directories you want the agent to access.
+The agent tried to access a file outside `workspace_root`. Widen `workspace_root` in the config to cover all the directories you want the agent to reach.
 
 **Shell commands fail on Windows**
-Ensure PowerShell is available: `powershell -Command "Get-Host"`. The runner uses `powershell -NoProfile -NonInteractive -Command "..."` internally.
+Verify PowerShell is available: `powershell -Command "Get-Host"`. The runner uses `powershell -NoProfile -NonInteractive -Command "..."` internally.
 
 **Connection keeps dropping**
-Enable debug logging (`log_level: debug`) to see the exact error. Check that port 443 outbound to `api.vectrify.ai` is not blocked by a firewall or corporate proxy.
+Set `log_level: debug` and check the logs. Verify outbound port 443 to `api.vectrify.ai` is not blocked by a firewall or proxy.
 
-**`go: command not found` when building**
-Go is not installed or not on PATH. See [Step 1](#step-1--install-go-if-you-dont-have-it) above.
+**No log file on Windows**
+The log file is created on first run. If it never appears, the service failed to start — check `Get-Service VectrifyRunner` and look for errors in the Windows Event Viewer under Application logs.
 
 ---
 
@@ -351,5 +193,5 @@ Go is not installed or not on PATH. See [Step 1](#step-1--install-go-if-you-dont
 | **Path containment** | Every file path is resolved to absolute, then checked against `workspace_root` before any I/O. Rejects `../` traversal. |
 | **Shell gating** | Shell execution is blocked unless `allow_shell: true` in config. The API also enforces this independently. |
 | **Outbound only** | The runner makes one outbound WebSocket connection. No ports are listened on. |
-| **Run as regular user** | Never run as root or Administrator. The runner has only the filesystem permissions of your user account. |
-| **Key never logged** | The `runner_key` appears only in the WebSocket URL query string. It is never written to log output. |
+| **Run as regular user** | The service runs as `LocalSystem` on Windows and as the installing user on Linux/macOS — never as a privileged superuser beyond what the installer requires. |
+| **Key never logged** | The `runner_key` is used only in the WebSocket URL query string and is never written to log output. |
