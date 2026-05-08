@@ -6,19 +6,20 @@
 # Usage:
 #   .\install.ps1
 
-$GITHUB_REPO = "vectrify/vectrify-agent-runner"
+$GITHUB_REPO = "kevin4885/vectrify-agent-runner"
+
+# Force TLS 1.2 — Windows PowerShell 5 defaults to TLS 1.0 which GitHub rejects.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ── Administrator check ───────────────────────────────────────────────────────
-$isAdmin = ([Security.Principal.WindowsPrincipal]
-            [Security.Principal.WindowsIdentity]::GetCurrent()
-           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 if (-not $isAdmin) {
     Write-Host ""
     Write-Host "  ERROR: This installer must run as Administrator." -ForegroundColor Red
     Write-Host ""
     Write-Host "  Open PowerShell as Administrator and run:" -ForegroundColor Yellow
-    Write-Host "  iwr -useb https://github.com/$GITHUB_REPO/releases/latest/download/install.ps1 | iex" -ForegroundColor Cyan
+    Write-Host "  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iwr -useb https://github.com/$GITHUB_REPO/releases/latest/download/install.ps1 | iex" -ForegroundColor Cyan
     Write-Host ""
     if ($PSCommandPath) { Read-Host "  Press Enter to exit" }
     exit 1

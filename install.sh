@@ -15,7 +15,7 @@ if [ ! -t 0 ] && [ -e /dev/tty ]; then
     exec < /dev/tty
 fi
 
-GITHUB_REPO="vectrify/vectrify-agent-runner"
+GITHUB_REPO="kevin4885/vectrify-agent-runner"
 
 # ── Platform detection ────────────────────────────────────────────────────────
 OS="$(uname -s)"
