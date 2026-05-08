@@ -49,6 +49,11 @@ type Config struct {
 	// ReconnectMaxBackoff is the maximum number of seconds to wait between
 	// reconnect attempts.  Defaults to 60.
 	ReconnectMaxBackoff int `yaml:"reconnect_max_backoff"`
+
+	// LogFile is an optional path to write logs to.
+	// When empty, logs go to stdout (fine for terminals and Linux/macOS services).
+	// Set automatically by install.ps1 on Windows since services have no stdout.
+	LogFile string `yaml:"log_file"`
 }
 
 // Load reads the config from the given path, applying defaults for

@@ -15,6 +15,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -23,6 +24,7 @@ import (
 	"vectrify/agent-runner/client"
 	"vectrify/agent-runner/config"
 	"vectrify/agent-runner/runner"
+	"vectrify/agent-runner/updater"
 )
 
 func main() {
@@ -55,7 +57,17 @@ func main() {
 	case "error":
 		logLevel = slog.LevelError
 	}
-	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	var logWriter io.Writer = os.Stdout
+	if cfg.LogFile != "" {
+		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening log file %q: %v\n", cfg.LogFile, err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		logWriter = f
+	}
+	log := slog.New(slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: logLevel}))
 
 	log.Info("vectrify agent runner starting",
 		"version",        config.Version,
@@ -72,6 +84,7 @@ func main() {
 // runInteractive runs the client with OS signal handling for graceful shutdown.
 // Used on all platforms when running directly in a terminal (not as a service daemon).
 func runInteractive(log *slog.Logger, c *client.Client) {
+	updater.Start(config.Version, log)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {

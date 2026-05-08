@@ -96,6 +96,27 @@ fi
 echo "  Binary : $SRC"
 echo ""
 
+# ── Update path: existing install detected ────────────────────────────────────
+if [ -f "$CONFIG_FILE" ]; then
+    printf "  Existing install detected - updating binary..."
+    if [ "$PLATFORM" = "linux" ]; then
+        systemctl stop vectrify-runner 2>/dev/null || true
+    elif [ "$PLATFORM" = "darwin" ]; then
+        launchctl stop ai.vectrify.runner 2>/dev/null || true
+    fi
+    sleep 2
+    install -m 755 "$SRC" "$INSTALL_BIN"
+    if [ "$PLATFORM" = "linux" ]; then
+        systemctl start vectrify-runner
+    elif [ "$PLATFORM" = "darwin" ]; then
+        launchctl start ai.vectrify.runner
+    fi
+    echo " done"
+    echo ""
+    if [ "$DOWNLOADED" = "true" ]; then rm -f "$TMP_BIN"; fi
+    exit 0
+fi
+
 # ── Prompt helpers ────────────────────────────────────────────────────────────
 read_required() {
     local label="$1"

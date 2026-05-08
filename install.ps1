@@ -13,6 +13,7 @@ function Install-VectrifyRunner {
     $InstallDir     = "C:\Program Files\VectrifyRunner"
     $ConfigDir      = "C:\ProgramData\VectrifyRunner"
     $ConfigFile     = "$ConfigDir\config.yaml"
+    $LogFile        = "$ConfigDir\vectrify-runner.log"
     $ExeDest        = "$InstallDir\vectrify-runner.exe"
 
     # ── Admin check ───────────────────────────────────────────────────────────
@@ -53,6 +54,26 @@ function Install-VectrifyRunner {
     }
     Write-Host "  Binary : $src" -ForegroundColor DarkGray
     Write-Host ""
+
+    # ── Update path: existing install detected ────────────────────────────────
+    if (Test-Path $ConfigFile) {
+        Write-Host "  Existing install detected - updating binary..." -NoNewline
+        $svc = Get-Service $ServiceName -EA SilentlyContinue
+        if ($svc -and $svc.Status -eq "Running") {
+            sc.exe stop $ServiceName | Out-Null
+            Start-Sleep 2
+        }
+        New-Item -ItemType Directory -Force $InstallDir | Out-Null
+        Copy-Item -Force $src $ExeDest
+        Start-Service $ServiceName
+        Write-Host " done" -ForegroundColor Green
+        Write-Host ""
+        $st = (Get-Service $ServiceName).Status
+        Write-Host "  $ServiceName : $st" -ForegroundColor $(if ($st -eq "Running") { "Green" } else { "Yellow" })
+        Write-Host ""
+        if ($downloaded) { Remove-Item $src -EA 0 }
+        return
+    }
 
     # ── Prompt helpers ────────────────────────────────────────────────────────
     function Ask-Required([string]$Label) {
@@ -135,6 +156,7 @@ workspace_root:        $workspaceRoot
 allow_shell:           $allowShellYaml
 log_level:             $logLevel
 reconnect_max_backoff: $backoff
+log_file:              $LogFile
 "@ | Set-Content -Encoding UTF8 $ConfigFile
     Write-Host " done" -ForegroundColor Green
 
@@ -163,6 +185,8 @@ reconnect_max_backoff: $backoff
     Write-Host "  $ServiceName : $st" -ForegroundColor $(if ($st -eq "Running") { "Green" } else { "Yellow" })
     Write-Host ""
     Write-Host "  Done!" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Logs : $LogFile"
     Write-Host ""
 
     if ($downloaded) { Remove-Item $src -EA 0 }

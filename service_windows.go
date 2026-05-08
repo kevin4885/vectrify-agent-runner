@@ -9,6 +9,8 @@ import (
 	"golang.org/x/sys/windows/svc"
 
 	"vectrify/agent-runner/client"
+	"vectrify/agent-runner/config"
+	"vectrify/agent-runner/updater"
 )
 
 // winSvc implements svc.Handler so vectrify-runner can be registered and
@@ -23,6 +25,8 @@ type winSvc struct {
 // stop/shutdown control requests.
 func (s *winSvc) Execute(_ []string, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
 	status <- svc.Status{State: svc.StartPending}
+
+	updater.Start(config.Version, s.log)
 
 	// Run the connection loop in the background so this goroutine stays free
 	// to handle SCM control requests.
