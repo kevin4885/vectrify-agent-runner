@@ -141,12 +141,11 @@ reconnect_max_backoff: $backoff
     Write-Host "  [3/5] Registering service..." -NoNewline
     $svc = Get-Service $ServiceName -EA SilentlyContinue
     if ($svc) {
-        if ($svc.Status -eq "Running") { sc.exe stop $ServiceName | Out-Null; Start-Sleep 2 }
+        if ($svc.Status -eq "Running") { Stop-Service $ServiceName -Force -EA 0; Start-Sleep 2 }
         sc.exe delete $ServiceName | Out-Null; Start-Sleep 1
     }
-    $binPath = "`"$ExeDest`" --config `"$ConfigFile`""
-    sc.exe create $ServiceName binPath= $binPath start= auto obj= LocalSystem DisplayName= $ServiceDisplay | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Host " FAILED (sc.exe exit $LASTEXITCODE)" -ForegroundColor Red; return }
+    New-Service -Name $ServiceName -DisplayName $ServiceDisplay -StartupType Automatic `
+        -BinaryPathName "`"$ExeDest`" --config `"$ConfigFile`"" | Out-Null
     sc.exe description $ServiceName "Connects to Vectrify Cloud and executes agent commands on this machine." | Out-Null
     Write-Host " done" -ForegroundColor Green
 
@@ -155,16 +154,13 @@ reconnect_max_backoff: $backoff
     Write-Host " done" -ForegroundColor Green
 
     Write-Host "  [5/5] Starting service..."    -NoNewline
-    Start-Sleep 1
-    sc.exe start $ServiceName | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Host " FAILED (sc.exe exit $LASTEXITCODE)" -ForegroundColor Red; return }
+    Start-Service $ServiceName
     Write-Host " done" -ForegroundColor Green
 
     # ── Done ──────────────────────────────────────────────────────────────────
     Write-Host ""
-    $query = sc.exe query $ServiceName | Out-String
-    $running = $query -match 'RUNNING'
-    Write-Host "  $ServiceName : $(if ($running) { "Running" } else { "Not running" })" -ForegroundColor $(if ($running) { "Green" } else { "Yellow" })
+    $st = (Get-Service $ServiceName).Status
+    Write-Host "  $ServiceName : $st" -ForegroundColor $(if ($st -eq "Running") { "Green" } else { "Yellow" })
     Write-Host ""
     Write-Host "  Done!" -ForegroundColor Cyan
     Write-Host ""
