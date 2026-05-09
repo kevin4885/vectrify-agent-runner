@@ -23,7 +23,7 @@ type Runner struct {
 func New(workspaceRoot string, log *slog.Logger) *Runner {
 	return &Runner{
 		fileOps: executor.NewFileOps(workspaceRoot),
-		shell:   executor.NewShell(workspaceRoot),
+		shell:   executor.NewShell(workspaceRoot, log),
 		log:     log,
 	}
 }

@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os/exec"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -26,11 +28,12 @@ type ShellResult struct {
 // Shell runs shell commands on the local machine.
 type Shell struct {
 	workspaceRoot string
+	log           *slog.Logger
 }
 
 // NewShell creates a Shell scoped to workspaceRoot as the default working dir.
-func NewShell(workspaceRoot string) *Shell {
-	return &Shell{workspaceRoot: workspaceRoot}
+func NewShell(workspaceRoot string, log *slog.Logger) *Shell {
+	return &Shell{workspaceRoot: workspaceRoot, log: log}
 }
 
 // Run executes cmd in workingDir (defaults to workspaceRoot), streaming output
@@ -38,14 +41,30 @@ func NewShell(workspaceRoot string) *Shell {
 //
 // The chunks and result channels are closed before Run returns.
 func (s *Shell) Run(
-	cmd         string,
-	workingDir  string,
+	cmd string,
+	workingDir string,
 	timeoutSecs int,
-	chunks      chan<- ShellChunk,
-	result      chan<- ShellResult,
+	chunks chan<- ShellChunk,
+	result chan<- ShellResult,
 ) {
 	defer close(chunks)
 	defer close(result)
+
+	// Recover must be declared AFTER the channel-close defers so it runs first
+	// (LIFO). At recovery time both channels are still open, so we can safely
+	// send an error result before the deferred closes fire.
+	defer func() {
+		if p := recover(); p != nil {
+			s.log.Error("shell.Run panic recovered",
+				"panic", p,
+				"stack", string(debug.Stack()),
+			)
+			select {
+			case result <- ShellResult{ExitCode: 1, OK: false}:
+			default: // result already has a value — nothing to do
+			}
+		}
+	}()
 
 	if workingDir == "" {
 		workingDir = s.workspaceRoot
@@ -85,8 +104,8 @@ func (s *Shell) Run(
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	go streamPipe(stdoutPipe, "stdout", chunks, &wg)
-	go streamPipe(stderrPipe, "stderr", chunks, &wg)
+	go s.streamPipe(stdoutPipe, "stdout", chunks, &wg)
+	go s.streamPipe(stderrPipe, "stderr", chunks, &wg)
 
 	wg.Wait()
 	err = c.Wait()
@@ -106,8 +125,17 @@ func (s *Shell) Run(
 	result <- ShellResult{ExitCode: exitCode, OK: exitCode == 0}
 }
 
-func streamPipe(r io.Reader, stream string, chunks chan<- ShellChunk, wg *sync.WaitGroup) {
+func (s *Shell) streamPipe(r io.Reader, stream string, chunks chan<- ShellChunk, wg *sync.WaitGroup) {
 	defer wg.Done()
+	defer func() {
+		if p := recover(); p != nil {
+			s.log.Error("streamPipe panic recovered",
+				"stream", stream,
+				"panic", p,
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
 	buf := make([]byte, 4096)
 	for {
 		n, err := r.Read(buf)

@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"time"
 )
 
@@ -37,6 +38,14 @@ func Start(currentVersion string, log *slog.Logger) {
 		return
 	}
 	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				log.Error("updater panic recovered",
+					"panic", p,
+					"stack", string(debug.Stack()),
+				)
+			}
+		}()
 		checkAndApply(currentVersion, log)
 		ticker := time.NewTicker(checkInterval)
 		defer ticker.Stop()
