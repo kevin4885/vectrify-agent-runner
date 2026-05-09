@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"runtime/debug"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -20,9 +21,9 @@ import (
 
 // Client manages one persistent WebSocket connection to the Vectrify API.
 type Client struct {
-	cfg     *config.Config
-	runner  *runner.Runner
-	log     *slog.Logger
+	cfg    *config.Config
+	runner *runner.Runner
+	log    *slog.Logger
 }
 
 // New creates a Client.
@@ -94,17 +95,37 @@ func (c *Client) connect() error {
 
 	c.log.Info("registered", "runner_id", ack["runner_id"])
 
-	// ── Message loop ──────────────────────────────────────────────────────────
+	// ── Dedicated writer goroutine ─────────────────────────────────────────────
+	// gorilla/websocket requires all writes to be serialized. A single writer
+	// goroutine owns conn.WriteJSON; everything else enqueues onto writeCh.
+	writeCh := make(chan interface{}, 64)
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for msg := range writeCh {
+			if err := conn.WriteJSON(msg); err != nil {
+				c.log.Warn("writer: send error", "err", err)
+				return
+			}
+		}
+	}()
+
+	// send enqueues a message for the writer. Safe to call from any goroutine.
 	send := func(msg interface{}) {
-		if err := conn.WriteJSON(msg); err != nil {
-			c.log.Warn("send error", "err", err)
+		select {
+		case writeCh <- msg:
+		case <-writerDone:
+			// Writer already exited (write error or connection closed); drop the message.
 		}
 	}
 
+	// ── Message loop ──────────────────────────────────────────────────────────
+	var readErr error
 	for {
 		_, msgBytes, err := conn.ReadMessage()
 		if err != nil {
-			return fmt.Errorf("read: %w", err)
+			readErr = fmt.Errorf("read: %w", err)
+			break
 		}
 
 		raw, err := runner.DecodeRaw(msgBytes)
@@ -114,9 +135,26 @@ func (c *Client) connect() error {
 		}
 
 		// Dispatch each command in its own goroutine so the recv loop is never
-		// blocked by a long-running shell command.
-		go c.runner.Dispatch(raw, send)
+		// blocked by a long-running shell command. A deferred recover ensures a
+		// panicking handler never crashes the process.
+		go func(raw protocol.RawCommand) {
+			defer func() {
+				if p := recover(); p != nil {
+					c.log.Error("dispatch panic recovered",
+						"panic", p,
+						"stack", string(debug.Stack()),
+					)
+				}
+			}()
+			c.runner.Dispatch(raw, send)
+		}(raw)
 	}
+
+	// Signal the writer to drain and exit, then wait for it.
+	close(writeCh)
+	<-writerDone
+
+	return readErr
 }
 
 // backoff returns the wait duration for the given attempt number.
