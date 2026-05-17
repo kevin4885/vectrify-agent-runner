@@ -61,7 +61,9 @@ func (f *FileOps) readFileLines(path string, viewRange []int) (string, error) {
 		return "", fmt.Errorf("reading file: %w", err)
 	}
 
-	lines := strings.Split(string(data), "\n")
+	// Normalize CRLF so the LLM always sees clean lines regardless of OS line endings.
+	normalized := strings.ReplaceAll(string(data), "\r\n", "\n")
+	lines := strings.Split(normalized, "\n")
 	// Remove trailing empty line that Split always adds for files ending in \n
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
@@ -154,6 +156,7 @@ func (f *FileOps) listDir(path string) (string, error) {
 }
 
 // WriteFile creates or overwrites a file with the given content.
+// Incoming content is normalized to LF so files on disk stay consistent.
 func (f *FileOps) WriteFile(path, content string) error {
 	clean, err := f.guardPath(path)
 	if err != nil {
@@ -162,6 +165,7 @@ func (f *FileOps) WriteFile(path, content string) error {
 	if err := os.MkdirAll(filepath.Dir(clean), 0755); err != nil {
 		return fmt.Errorf("creating parent directories: %w", err)
 	}
+	content = strings.ReplaceAll(content, "\r\n", "\n")
 	return os.WriteFile(clean, []byte(content), 0644)
 }
 
@@ -175,7 +179,11 @@ func (f *FileOps) StrReplace(path, oldStr, newStr string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("file not found: %s", path)
 	}
-	content := string(data)
+	// Normalize CRLF in the file and in both operands so matches succeed
+	// regardless of whether the LLM or the file uses CRLF or LF.
+	content := strings.ReplaceAll(string(data), "\r\n", "\n")
+	oldStr = strings.ReplaceAll(oldStr, "\r\n", "\n")
+	newStr = strings.ReplaceAll(newStr, "\r\n", "\n")
 	count := strings.Count(content, oldStr)
 	if count == 0 {
 		return "", fmt.Errorf("the specified text was not found in the file")
@@ -201,7 +209,8 @@ func (f *FileOps) Insert(path string, lineNum int, newStr string) (string, error
 		return "", fmt.Errorf("file not found: %s", path)
 	}
 
-	lines := strings.Split(string(data), "\n")
+	// Normalize CRLF before splitting so inserted content aligns correctly.
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
 	if lineNum < 0 || lineNum > len(lines) {
 		return "", fmt.Errorf("invalid line number %d (file has %d lines)", lineNum, len(lines))
 	}
