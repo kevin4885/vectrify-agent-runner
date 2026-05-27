@@ -2,16 +2,29 @@
 #
 # One-liner (run from an Administrator PowerShell):
 #   iwr -useb https://github.com/kevin4885/vectrify-agent-runner/releases/latest/download/install.ps1 | iex
+#
+# To install a second instance for a different Vectrify account:
+#   .\install.ps1 -InstanceName Account2
+
+param(
+    [string]$InstanceName = ""
+)
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 function Install-VectrifyRunner {
 
     $GITHUB_REPO    = "kevin4885/vectrify-agent-runner"
-    $ServiceName    = "VectrifyRunner"
-    $ServiceDisplay = "Vectrify Agent Runner"
-    $InstallDir     = "C:\Program Files\VectrifyRunner"
-    $ConfigDir      = "C:\ProgramData\VectrifyRunner"
+
+    # When InstanceName is provided, all names and paths get a suffix so multiple
+    # instances can coexist as separate Windows services with separate configs.
+    $suffix         = if ($InstanceName) { "-$InstanceName" } else { "" }
+    $displaySuffix  = if ($InstanceName) { " ($InstanceName)" } else { "" }
+
+    $ServiceName    = "VectrifyRunner$suffix"
+    $ServiceDisplay = "Vectrify Agent Runner$displaySuffix"
+    $InstallDir     = "C:\Program Files\VectrifyRunner$suffix"
+    $ConfigDir      = "C:\ProgramData\VectrifyRunner$suffix"
     $ConfigFile     = "$ConfigDir\config.yaml"
     $LogFile        = "$ConfigDir\vectrify-runner.log"
     $ExeDest        = "$InstallDir\vectrify-runner.exe"
