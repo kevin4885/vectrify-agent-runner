@@ -19,6 +19,23 @@ import (
 	"vectrify/agent-runner/runner"
 )
 
+const (
+	// pingInterval is how often the runner sends a WebSocket ping to the server.
+	// Keeps the connection alive through NAT gateways and load-balancer idle timeouts.
+	pingInterval = 30 * time.Second
+
+	// readDeadline is the maximum time to wait for any inbound message (including
+	// pong replies).  Must be greater than pingInterval to allow time for the
+	// round-trip.
+	readDeadline = 90 * time.Second
+
+	// healthyDuration is the minimum uptime for a connection to be considered
+	// healthy.  If connect() ran at least this long before returning, the attempt
+	// counter is reset so the next reconnect is fast regardless of how many prior
+	// failures occurred.
+	healthyDuration = 30 * time.Second
+)
+
 // Client manages one persistent WebSocket connection to the Vectrify API.
 type Client struct {
 	cfg    *config.Config
@@ -33,15 +50,26 @@ func New(cfg *config.Config, r *runner.Runner, log *slog.Logger) *Client {
 
 // RunForever connects and reconnects indefinitely until the process is stopped.
 // It uses exponential backoff capped at cfg.ReconnectMaxBackoff seconds.
+// The attempt counter resets whenever a connection was healthy for at least
+// healthyDuration, so a brief blip after hours of uptime reconnects quickly.
 func (c *Client) RunForever() {
 	attempt := 0
 	for {
 		c.log.Info("connecting", "url", c.cfg.APIURL, "attempt", attempt+1)
+		start := time.Now()
 		err := c.connect()
+		uptime := time.Since(start)
+
 		if err != nil {
-			attempt++
+			// Reset backoff if the connection was healthy before it dropped so a
+			// brief network hiccup after a long-running session reconnects quickly.
+			if uptime >= healthyDuration {
+				attempt = 0
+			} else {
+				attempt++
+			}
 			wait := backoff(attempt, c.cfg.ReconnectMaxBackoff)
-			c.log.Warn("connection lost", "err", err, "retry_in", wait)
+			c.log.Warn("connection lost", "err", err, "uptime", uptime.Round(time.Second), "retry_in", wait)
 			time.Sleep(wait)
 		} else {
 			// Clean disconnect (should not happen in normal operation).
@@ -95,17 +123,45 @@ func (c *Client) connect() error {
 
 	c.log.Info("registered", "runner_id", ack["runner_id"])
 
+	// ── Keepalive: pong handler resets the read deadline ─────────────────────
+	// The writer goroutine sends a ping every pingInterval.  The server must
+	// reply with a pong (or send any message) within readDeadline.  If it does
+	// not, ReadMessage returns a timeout error and we reconnect cleanly instead
+	// of hanging on a silently dead connection.
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(readDeadline))
+	})
+	if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+		return fmt.Errorf("setting initial read deadline: %w", err)
+	}
+
 	// ── Dedicated writer goroutine ─────────────────────────────────────────────
-	// gorilla/websocket requires all writes to be serialized. A single writer
-	// goroutine owns conn.WriteJSON; everything else enqueues onto writeCh.
+	// gorilla/websocket requires all writes to be serialized.  A single writer
+	// goroutine owns conn.WriteJSON / conn.WriteMessage; everything else enqueues
+	// onto writeCh.  The same goroutine fires periodic pings via a ticker so the
+	// ping and regular writes are never concurrent.
 	writeCh := make(chan interface{}, 64)
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
-		for msg := range writeCh {
-			if err := conn.WriteJSON(msg); err != nil {
-				c.log.Warn("writer: send error", "err", err)
-				return
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case msg, ok := <-writeCh:
+				if !ok {
+					// Channel closed — all queued messages drained, exit.
+					return
+				}
+				if err := conn.WriteJSON(msg); err != nil {
+					c.log.Warn("writer: send error", "err", err)
+					return
+				}
+			case <-ticker.C:
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					c.log.Warn("writer: ping error", "err", err)
+					return
+				}
 			}
 		}
 	}()
@@ -127,6 +183,9 @@ func (c *Client) connect() error {
 			readErr = fmt.Errorf("read: %w", err)
 			break
 		}
+		// Reset the read deadline on every inbound message, not just pongs,
+		// so an active command stream also keeps the deadline rolling.
+		_ = conn.SetReadDeadline(time.Now().Add(readDeadline))
 
 		raw, err := runner.DecodeRaw(msgBytes)
 		if err != nil {
@@ -135,7 +194,7 @@ func (c *Client) connect() error {
 		}
 
 		// Dispatch each command in its own goroutine so the recv loop is never
-		// blocked by a long-running shell command. A deferred recover ensures a
+		// blocked by a long-running shell command.  A deferred recover ensures a
 		// panicking handler never crashes the process.
 		go func(raw protocol.RawCommand) {
 			defer func() {
