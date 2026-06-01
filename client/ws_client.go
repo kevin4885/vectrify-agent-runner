@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -40,18 +41,40 @@ const (
 	// counter is reset so the next reconnect is fast regardless of how many prior
 	// failures occurred.
 	healthyDuration = 30 * time.Second
+
+	// maxDispatchConcurrency is the maximum number of command goroutines that may
+	// run simultaneously.  Prevents unbounded goroutine growth if the API sends a
+	// burst of commands (e.g. due to a server-side bug or replay).
+	maxDispatchConcurrency = 32
 )
 
 // Client manages one persistent WebSocket connection to the Vectrify API.
 type Client struct {
-	cfg    *config.Config
-	runner *runner.Runner
-	log    *slog.Logger
+	cfg            *config.Config
+	runner         *runner.Runner
+	log            *slog.Logger
+	activeCommands atomic.Int64 // count of in-flight dispatch goroutines
 }
 
 // New creates a Client.
 func New(cfg *config.Config, r *runner.Runner, log *slog.Logger) *Client {
 	return &Client{cfg: cfg, runner: r, log: log}
+}
+
+// Drain blocks until all in-flight dispatch goroutines have finished or
+// timeout elapses.  Called by the auto-updater before os.Exit so that
+// commands already dispatched can complete and send their results back.
+func (c *Client) Drain(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if c.activeCommands.Load() == 0 {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	c.log.Warn("drain timeout: exiting with in-flight commands",
+		"active", c.activeCommands.Load(),
+	)
 }
 
 // RunForever connects and reconnects indefinitely until the process is stopped.
@@ -122,9 +145,11 @@ func (c *Client) connect() error {
 		AllowShell:    c.cfg.AllowShell,
 		Version:       config.Version,
 	}
+	_ = conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 	if err := conn.WriteJSON(reg); err != nil {
 		return fmt.Errorf("sending register: %w", err)
 	}
+	_ = conn.SetWriteDeadline(time.Time{}) // clear; writer goroutine sets its own per-write
 
 	// Read ack
 	_, ackBytes, err := conn.ReadMessage()
@@ -232,8 +257,22 @@ func (c *Client) connect() error {
 
 		// Dispatch each command in its own goroutine so the recv loop is never
 		// blocked by a long-running shell command.  A deferred recover ensures a
-		// panicking handler never crashes the process.
+		// panicking handler never crashes the process.  The semaphore limits
+		// concurrent goroutines; if full the command is rejected with an error so
+		// the API caller gets a clear response rather than a silent queue build-up.
+		cmdID := raw.CmdID()
+		if c.activeCommands.Load() >= maxDispatchConcurrency {
+			c.log.Warn("dispatch: concurrency limit reached, rejecting command", "cmd_id", cmdID)
+			send(protocol.ErrorMsg{
+				CmdID:   cmdID,
+				Type:    "error",
+				Message: fmt.Sprintf("runner busy: concurrency limit of %d reached", maxDispatchConcurrency),
+			})
+			continue
+		}
+		c.activeCommands.Add(1)
 		go func(raw protocol.RawCommand) {
+			defer c.activeCommands.Add(-1)
 			defer func() {
 				if p := recover(); p != nil {
 					c.log.Error("dispatch panic recovered",

@@ -1,4 +1,4 @@
-// Vectrify Agent Runner
+﻿// Vectrify Agent Runner
 //
 // A lightweight daemon that connects to the Vectrify API over a persistent
 // WebSocket and executes commands on the local machine: file operations,
@@ -62,13 +62,13 @@ func main() {
 	}
 	var logWriter io.Writer = os.Stdout
 	if cfg.LogFile != "" {
-		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		rw, err := newRotatingWriter(cfg.LogFile, logMaxBytes)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error opening log file %q: %v\n", cfg.LogFile, err)
 			os.Exit(1)
 		}
-		defer f.Close()
-		logWriter = f
+		defer rw.Close()
+		logWriter = rw
 	}
 	log := slog.New(slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: logLevel}))
 
@@ -87,7 +87,7 @@ func main() {
 // runInteractive runs the client with OS signal handling for graceful shutdown.
 // Used on all platforms when running directly in a terminal (not as a service daemon).
 func runInteractive(log *slog.Logger, c *client.Client) {
-	updater.Start(config.Version, log)
+	updater.Start(config.Version, log, c.Drain)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {

@@ -1,4 +1,4 @@
-// Package runner implements the main command dispatch loop.
+﻿// Package runner implements the main command dispatch loop.
 // It reads RawCommand messages from the WebSocket client, routes them to the
 // appropriate executor, and writes back result/stream/done/error responses.
 package runner
@@ -7,10 +7,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"vectrify/agent-runner/executor"
 	"vectrify/agent-runner/protocol"
 )
+
+// maxShellTimeout is the hard upper limit on any shell command timeout requested
+// by the API.  Prevents a rogue or buggy server payload from holding a dispatch
+// goroutine for an unbounded duration.
+const maxShellTimeout = 10 * time.Minute
 
 // Runner dispatches commands received from the API to local executors.
 type Runner struct {
@@ -116,6 +122,11 @@ func (r *Runner) handleShell(cmdID string, raw protocol.RawCommand, send func(in
 	timeout := protocol.Int(raw["timeout_seconds"])
 	if timeout <= 0 {
 		timeout = 60
+	}
+	// Hard cap: prevent a runaway command from holding a dispatch goroutine
+	// indefinitely regardless of what the API sends.
+	if time.Duration(timeout)*time.Second > maxShellTimeout {
+		timeout = int(maxShellTimeout.Seconds())
 	}
 
 	chunks := make(chan executor.ShellChunk, 64)

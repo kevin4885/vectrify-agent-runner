@@ -7,20 +7,56 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"time"
 )
 
-func apply(version string, log *slog.Logger) error {
+func apply(version string, assets []githubAsset, log *slog.Logger, drain func(time.Duration)) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("getting exe path: %w", err)
 	}
 
-	url     := fmt.Sprintf("https://github.com/%s/releases/download/v%s/vectrify-runner-windows-amd64.exe", githubRepo, version)
+	assetName   := "vectrify-runner-windows-amd64.exe"
+	manifestName := "checksums.txt"
+
+	binURL, err := assetURL(assets, assetName)
+	if err != nil {
+		return err
+	}
+	manifestURL, err := assetURL(assets, manifestName)
+	if err != nil {
+		return err
+	}
+
 	tmpPath := exePath + ".new"
 
-	log.Info("auto-update: downloading", "version", version)
-	if err := downloadFile(url, tmpPath); err != nil {
+	log.Info("auto-update: downloading", "version", version, "asset", assetName)
+	if err := downloadFile(binURL, tmpPath); err != nil {
 		return err
+	}
+
+	// ── Verify checksum before touching the running binary ───────────────────
+	log.Info("auto-update: verifying checksum")
+	sums, err := downloadSHA256Manifest(manifestURL)
+	if err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("fetching checksum manifest: %w", err)
+	}
+	expected, ok := sums[assetName]
+	if !ok {
+		os.Remove(tmpPath)
+		return fmt.Errorf("checksum for %q not found in manifest", assetName)
+	}
+	if err := verifySHA256(tmpPath, expected); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("checksum verification failed: %w", err)
+	}
+	log.Info("auto-update: checksum verified")
+
+	// ── Drain in-flight commands before exiting ───────────────────────────────
+	if drain != nil {
+		log.Info("auto-update: draining in-flight commands", "timeout", drainTimeout)
+		drain(drainTimeout)
 	}
 
 	// Write a PowerShell script that stops the service, swaps the binary, and restarts.

@@ -1,4 +1,4 @@
-//go:build windows
+﻿//go:build windows
 
 package main
 
@@ -26,7 +26,7 @@ type winSvc struct {
 func (s *winSvc) Execute(_ []string, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
 	status <- svc.Status{State: svc.StartPending}
 
-	updater.Start(config.Version, s.log)
+	updater.Start(config.Version, s.log, s.client.Drain)
 
 	// Run the connection loop in the background so this goroutine stays free
 	// to handle SCM control requests.
