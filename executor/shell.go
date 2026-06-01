@@ -76,7 +76,11 @@ func (s *Shell) Run(
 
 	var c *exec.Cmd
 	if runtime.GOOS == "windows" {
-		c = exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", cmd)
+		// Force UTF-8 I/O so file content with Unicode characters (em-dashes,
+		// ellipses, etc.) is not mangled by PowerShell's default system code page.
+		const utf8Preamble = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " +
+			"$OutputEncoding = [System.Text.Encoding]::UTF8; "
+		c = exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", utf8Preamble+cmd)
 	} else {
 		c = exec.CommandContext(ctx, "bash", "-c", cmd)
 	}

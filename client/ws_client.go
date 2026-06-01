@@ -1,4 +1,4 @@
-// Package client manages the persistent WebSocket connection to the Vectrify API.
+﻿// Package client manages the persistent WebSocket connection to the Vectrify API.
 // It handles authentication, the registration handshake, reconnection with
 // exponential backoff, and the bidirectional message loop.
 package client
@@ -29,6 +29,12 @@ const (
 	// round-trip.
 	readDeadline = 90 * time.Second
 
+	// writeDeadline is the maximum time allowed for a single WebSocket write.
+	// Without this, a half-open TCP connection (reads fail but the kernel send
+	// buffer still accepts bytes) causes WriteJSON/WriteMessage to block forever,
+	// which hangs <-writerDone in connect() and prevents RunForever from retrying.
+	writeDeadline = 10 * time.Second
+
 	// healthyDuration is the minimum uptime for a connection to be considered
 	// healthy.  If connect() ran at least this long before returning, the attempt
 	// counter is reset so the next reconnect is fast regardless of how many prior
@@ -52,12 +58,14 @@ func New(cfg *config.Config, r *runner.Runner, log *slog.Logger) *Client {
 // It uses exponential backoff capped at cfg.ReconnectMaxBackoff seconds.
 // The attempt counter resets whenever a connection was healthy for at least
 // healthyDuration, so a brief blip after hours of uptime reconnects quickly.
+// Any unexpected panic inside connect() is caught here so the loop always
+// continues rather than crashing the process.
 func (c *Client) RunForever() {
 	attempt := 0
 	for {
 		c.log.Info("connecting", "url", c.cfg.APIURL, "attempt", attempt+1)
 		start := time.Now()
-		err := c.connect()
+		err := c.safeConnect()
 		uptime := time.Since(start)
 
 		if err != nil {
@@ -77,6 +85,19 @@ func (c *Client) RunForever() {
 			time.Sleep(2 * time.Second)
 		}
 	}
+}
+
+// safeConnect wraps connect() with a panic recovery so an unexpected panic
+// inside the connection loop (e.g. nil pointer, bad server response) is
+// treated as a retriable error rather than crashing the process.
+func (c *Client) safeConnect() (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic in connect: %v\n%s", p, string(debug.Stack()))
+			c.log.Error("connect panic recovered", "panic", p)
+		}
+	}()
+	return c.connect()
 }
 
 // connect establishes the WebSocket, completes the registration handshake,
@@ -140,24 +161,39 @@ func (c *Client) connect() error {
 	// goroutine owns conn.WriteJSON / conn.WriteMessage; everything else enqueues
 	// onto writeCh.  The same goroutine fires periodic pings via a ticker so the
 	// ping and regular writes are never concurrent.
-	writeCh := make(chan interface{}, 64)
+	// writeCh is intentionally NEVER closed — closing it would cause a panic if
+	// a long-running dispatch goroutine calls send() after the connection dies.
+	// Instead, stopWriter is closed to signal the writer to exit cleanly.
+	// SetWriteDeadline is set before every write so a half-open TCP connection
+	// (reads fail but kernel send buffer still accepts bytes) cannot block the
+	// writer indefinitely, which would hang <-writerDone and freeze RunForever.
+	writeCh    := make(chan interface{}, 64)
+	stopWriter := make(chan struct{})
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
+		defer func() {
+			if p := recover(); p != nil {
+				c.log.Error("writer panic recovered",
+					"panic", p,
+					"stack", string(debug.Stack()),
+				)
+			}
+		}()
 		ticker := time.NewTicker(pingInterval)
 		defer ticker.Stop()
 		for {
 			select {
-			case msg, ok := <-writeCh:
-				if !ok {
-					// Channel closed — all queued messages drained, exit.
-					return
-				}
+			case <-stopWriter:
+				return
+			case msg := <-writeCh:
+				_ = conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 				if err := conn.WriteJSON(msg); err != nil {
 					c.log.Warn("writer: send error", "err", err)
 					return
 				}
 			case <-ticker.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 					c.log.Warn("writer: ping error", "err", err)
 					return
@@ -166,7 +202,8 @@ func (c *Client) connect() error {
 		}
 	}()
 
-	// send enqueues a message for the writer. Safe to call from any goroutine.
+	// send enqueues a message for the writer. Safe to call from any goroutine
+	// at any time — writeCh is never closed so this never panics.
 	send := func(msg interface{}) {
 		select {
 		case writeCh <- msg:
@@ -209,8 +246,8 @@ func (c *Client) connect() error {
 		}(raw)
 	}
 
-	// Signal the writer to drain and exit, then wait for it.
-	close(writeCh)
+	// Signal the writer to stop, then wait for it to exit.
+	close(stopWriter)
 	<-writerDone
 
 	return readErr
