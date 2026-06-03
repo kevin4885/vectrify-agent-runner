@@ -23,10 +23,6 @@ func apply(version string, assets []githubAsset, log *slog.Logger, drain func(ti
 	if err != nil {
 		return err
 	}
-	manifestURL, err := assetURL(assets, manifestName)
-	if err != nil {
-		return err
-	}
 
 	tmpPath := exePath + ".new"
 
@@ -36,22 +32,31 @@ func apply(version string, assets []githubAsset, log *slog.Logger, drain func(ti
 	}
 
 	// ── Verify checksum before touching the running binary ───────────────────
-	log.Info("auto-update: verifying checksum")
-	sums, err := downloadSHA256Manifest(manifestURL)
+	// Checksum verification is optional: if the release does not include a
+	// checksums.txt manifest we log a warning and proceed.  This keeps updates
+	// working for releases that pre-date the manifest, while still verifying
+	// integrity whenever the manifest is present.
+	manifestURL, err := assetURL(assets, manifestName)
 	if err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("fetching checksum manifest: %w", err)
+		log.Warn("auto-update: no checksum manifest in release, skipping verification", "version", version)
+	} else {
+		log.Info("auto-update: verifying checksum")
+		sums, err := downloadSHA256Manifest(manifestURL)
+		if err != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("fetching checksum manifest: %w", err)
+		}
+		expected, ok := sums[assetName]
+		if !ok {
+			os.Remove(tmpPath)
+			return fmt.Errorf("checksum for %q not found in manifest", assetName)
+		}
+		if err := verifySHA256(tmpPath, expected); err != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("checksum verification failed: %w", err)
+		}
+		log.Info("auto-update: checksum verified")
 	}
-	expected, ok := sums[assetName]
-	if !ok {
-		os.Remove(tmpPath)
-		return fmt.Errorf("checksum for %q not found in manifest", assetName)
-	}
-	if err := verifySHA256(tmpPath, expected); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("checksum verification failed: %w", err)
-	}
-	log.Info("auto-update: checksum verified")
 
 	// ── Drain in-flight commands before exiting ───────────────────────────────
 	if drain != nil {
