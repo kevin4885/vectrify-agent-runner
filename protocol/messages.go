@@ -7,6 +7,13 @@
 //  2. Runner sends RegisterMsg (first frame after accept).
 //  3. API sends RegisteredMsg ack.
 //  4. API sends CommandMsg frames; runner sends back ResultMsg / StreamMsg / DoneMsg / ErrorMsg.
+//
+// Command types:
+//
+//	file_op       — file CRUD (view/create/str_replace/insert/delete)
+//	shell         — run a shell command (bash or PowerShell), requires allow_shell=true
+//	git           — structured git operations
+//	file_transfer — copy a file between S3 (presigned URL) and the runner filesystem
 package protocol
 
 // ── Outbound (Runner → API) ────────────────────────────────────────────────────
@@ -100,6 +107,20 @@ func Int(v interface{}) int {
 		return int(n)
 	case int64:
 		return int(n)
+	}
+	return 0
+}
+
+// Int64 extracts an int64 value from a raw map field.
+// JSON numbers decode as float64; this handles that plus int and int64 inputs.
+func Int64(v interface{}) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case float64:
+		return int64(n)
 	}
 	return 0
 }

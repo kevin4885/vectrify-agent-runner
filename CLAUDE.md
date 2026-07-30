@@ -18,8 +18,8 @@ Vectrify Cloud (AWS)                    Customer Machine
      │                                        │
      └─ runner tools                          ├─ file_op   (read/write/list/delete)
         runner_file_editor                    ├─ shell     (bash or PowerShell)
-        runner_shell                          └─ git       (structured git ops)
-        runner_git
+        runner_shell                          ├─ git       (structured git ops)
+        runner_git                            └─ file_transfer (S3 ↔ runner filesystem)
 ```
 
 ---
@@ -48,6 +48,7 @@ vectrify-agent-runner/
 │   └── ws_client.go       WebSocket connection, registration handshake, reconnect with backoff
 ├── executor/
 │   ├── file_ops.go        File CRUD — read (with line numbers), write, str_replace, insert, delete
+│   ├── file_transfer.go   File transfer via presigned S3 URLs (download runner←S3, upload runner→S3)
 │   └── shell.go           Shell execution (bash/PowerShell) + structured git operations
 └── runner/
     └── runner.go          Command dispatch loop — routes cmd_type to executor, formats responses
@@ -92,7 +93,18 @@ All messages are JSON over the WebSocket.
 { "cmd_id": "uuid", "type": "file_op",  "command": "insert", "path": "...", "insert_line": 5, "new_str": "..." }
 { "cmd_id": "uuid", "type": "shell",    "command": "npm test", "working_dir": "...", "timeout_seconds": 60 }
 { "cmd_id": "uuid", "type": "git",      "operation": "commit", "working_dir": "...", "message": "..." }
+{ "cmd_id": "uuid", "type": "file_transfer", "direction": "download", "url": "<presigned-GET>",
+  "path": "/absolute/path/on/runner", "max_bytes": 104857600, "overwrite": false }
+{ "cmd_id": "uuid", "type": "file_transfer", "direction": "upload",   "url": "<presigned-PUT>",
+  "path": "/absolute/path/on/runner", "max_bytes": 104857600 }
 ```
+
+**file_transfer notes:**
+- `direction`: `"download"` = S3 → runner filesystem; `"upload"` = runner filesystem → S3.
+- `url`: HTTPS presigned URL only. The runner never logs this value.
+- `path`: absolute path on the runner machine; must be inside `workspace_root`.
+- `max_bytes`: maximum file size in bytes (default/max 104857600 = 100 MiB).
+- `overwrite`: download only — if the destination already exists and `overwrite=false` the command fails with a descriptive error.
 
 ### Runner → API (responses)
 ```json

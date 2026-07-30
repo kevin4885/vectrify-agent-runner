@@ -20,17 +20,19 @@ const maxShellTimeout = 10 * time.Minute
 
 // Runner dispatches commands received from the API to local executors.
 type Runner struct {
-	fileOps *executor.FileOps
-	shell   *executor.Shell
-	log     *slog.Logger
+	fileOps       *executor.FileOps
+	shell         *executor.Shell
+	workspaceRoot string
+	log           *slog.Logger
 }
 
 // New creates a Runner with executors scoped to workspaceRoot.
 func New(workspaceRoot string, log *slog.Logger) *Runner {
 	return &Runner{
-		fileOps: executor.NewFileOps(workspaceRoot),
-		shell:   executor.NewShell(workspaceRoot, log),
-		log:     log,
+		fileOps:       executor.NewFileOps(workspaceRoot),
+		shell:         executor.NewShell(workspaceRoot, log),
+		workspaceRoot: workspaceRoot,
+		log:           log,
 	}
 }
 
@@ -50,6 +52,8 @@ func (r *Runner) Dispatch(raw protocol.RawCommand, send func(interface{})) {
 		r.handleShell(cmdID, raw, send)
 	case "git":
 		r.handleGit(cmdID, raw, send)
+	case "file_transfer":
+		r.handleFileTransfer(cmdID, raw, send)
 	default:
 		send(protocol.ErrorMsg{
 			CmdID:   cmdID,
@@ -164,6 +168,32 @@ func (r *Runner) handleGit(cmdID string, raw protocol.RawCommand, send func(inte
 		return
 	}
 	send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: true, Data: output})
+}
+
+// ── File transfer ──────────────────────────────────────────────────────────────
+
+func (r *Runner) handleFileTransfer(cmdID string, raw protocol.RawCommand, send func(interface{})) {
+	direction, _ := raw["direction"].(string)
+	url, _ := raw["url"].(string)
+	path, _ := raw["path"].(string)
+	maxBytes := protocol.Int64(raw["max_bytes"])
+	if maxBytes <= 0 {
+		maxBytes = 100 * 1024 * 1024 // default 100 MiB
+	}
+	overwrite := protocol.Bool(raw["overwrite"])
+
+	// Never log the URL — it contains presigned bearer credentials.
+	r.log.Info("file_transfer", "cmd_id", cmdID, "direction", direction, "path", path)
+
+	result, err := executor.TransferFile(r.workspaceRoot, direction, url, path, maxBytes, overwrite)
+	if err != nil {
+		send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: false, Error: err.Error()})
+		return
+	}
+
+	// Encode result as a small JSON string (matches the ResultMsg.Data convention).
+	data := fmt.Sprintf(`{"bytes":%d,"sha256":%q}`, result.Bytes, result.SHA256)
+	send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: true, Data: data})
 }
 
 // DecodeRaw decodes a raw JSON WebSocket message into a RawCommand.
