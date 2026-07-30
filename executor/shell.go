@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -28,12 +30,50 @@ type ShellResult struct {
 // Shell runs shell commands on the local machine.
 type Shell struct {
 	workspaceRoot string
+	pythonVenv    string // optional: prepend venv bin dir to PATH for every command
 	log           *slog.Logger
 }
 
 // NewShell creates a Shell scoped to workspaceRoot as the default working dir.
-func NewShell(workspaceRoot string, log *slog.Logger) *Shell {
-	return &Shell{workspaceRoot: workspaceRoot, log: log}
+// pythonVenv is an optional path to a Python virtual environment root directory;
+// when non-empty its Scripts/ (Windows) or bin/ (Linux/macOS) sub-directory is
+// prepended to PATH so that "python", "pip", and installed CLI tools are
+// available without callers needing to hardcode the full venv path.
+func NewShell(workspaceRoot string, pythonVenv string, log *slog.Logger) *Shell {
+	return &Shell{workspaceRoot: workspaceRoot, pythonVenv: pythonVenv, log: log}
+}
+
+// venvBinDir returns the platform-specific Scripts/bin sub-directory of the
+// configured venv, or an empty string if no venv is configured.
+func (s *Shell) venvBinDir() string {
+	if s.pythonVenv == "" {
+		return ""
+	}
+	if runtime.GOOS == "windows" {
+		return filepath.Join(s.pythonVenv, "Scripts")
+	}
+	return filepath.Join(s.pythonVenv, "bin")
+}
+
+// buildEnv returns an environment slice for exec.Cmd that is identical to the
+// current process environment except that binDir is prepended to PATH.
+// If binDir is empty the current process environment is returned unchanged (nil).
+func buildEnv(binDir string) []string {
+	if binDir == "" {
+		return nil // inherit unchanged
+	}
+	base := os.Environ()
+	result := make([]string, 0, len(base))
+	for _, e := range base {
+		if strings.HasPrefix(strings.ToUpper(e), "PATH=") {
+			// Preserve the original key casing (PATH on Unix, Path on Windows).
+			eq := strings.Index(e, "=")
+			result = append(result, e[:eq+1]+binDir+string(os.PathListSeparator)+e[eq+1:])
+		} else {
+			result = append(result, e)
+		}
+	}
+	return result
 }
 
 // Run executes cmd in workingDir (defaults to workspaceRoot), streaming output
@@ -85,6 +125,7 @@ func (s *Shell) Run(
 		c = exec.CommandContext(ctx, "bash", "-c", cmd)
 	}
 	c.Dir = workingDir
+	c.Env = buildEnv(s.venvBinDir())
 
 	stdoutPipe, err := c.StdoutPipe()
 	if err != nil {

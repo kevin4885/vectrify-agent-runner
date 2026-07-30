@@ -116,6 +116,7 @@ workspace_root:       /home/user/projects  # all file ops must be inside this pa
 allow_shell:          false             # set true to enable runner_shell commands
 log_level:            info              # debug | info | warn | error
 reconnect_max_backoff: 60               # seconds
+python_venv:          /home/user/.venvs/global  # optional: venv prepended to PATH for all shell commands
 ```
 
 ---

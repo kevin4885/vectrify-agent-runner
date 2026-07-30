@@ -77,9 +77,10 @@ func main() {
 		"platform",       config.Platform(),
 		"workspace_root", cfg.WorkspaceRoot,
 		"allow_shell",    cfg.AllowShell,
+		"python_venv",    cfg.PythonVenv,
 	)
 
-	r := runner.New(cfg.WorkspaceRoot, log)
+	r := runner.New(cfg.WorkspaceRoot, cfg.PythonVenv, log)
 	c := client.New(cfg, r, log)
 	runService(log, c)
 }

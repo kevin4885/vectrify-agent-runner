@@ -54,6 +54,14 @@ type Config struct {
 	// When empty, logs go to stdout (fine for terminals and Linux/macOS services).
 	// Set automatically by install.ps1 on Windows since services have no stdout.
 	LogFile string `yaml:"log_file"`
+
+	// PythonVenv is an optional path to a Python virtual environment root.
+	// When set, the venv's Scripts/ (Windows) or bin/ (Linux/macOS) directory is
+	// prepended to PATH for every shell command the runner executes, so that
+	// "python", "pip", and any installed CLI tools are available without agents
+	// needing to hardcode the full venv path.
+	// Example: /home/user/.venvs/global  or  C:\venvs\global
+	PythonVenv string `yaml:"python_venv"`
 }
 
 // Load reads the config from the given path, applying defaults for

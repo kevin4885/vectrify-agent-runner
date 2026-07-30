@@ -205,6 +205,10 @@ while true; do
     echo "  Must be a positive integer."
 done
 
+# python_venv (optional)
+read -rp "  Python venv path (optional — leave blank to skip): " PYTHON_VENV
+PYTHON_VENV="$(echo "$PYTHON_VENV" | xargs 2>/dev/null || echo "$PYTHON_VENV")"
+
 KEY_PREVIEW="${RUNNER_KEY:0:8}..."
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -215,6 +219,9 @@ echo "  runner_key     : $KEY_PREVIEW"
 echo "  allow_shell    : $ALLOW_SHELL"
 echo "  log_level      : $LOG_LEVEL"
 echo "  backoff        : $BACKOFF s"
+if [ -n "$PYTHON_VENV" ]; then
+echo "  python_venv    : $PYTHON_VENV"
+fi
 echo "  install path   : $INSTALL_BIN"
 echo "  config file    : $CONFIG_FILE"
 echo "  ----------------------------------------"
@@ -243,6 +250,10 @@ allow_shell:           $ALLOW_SHELL
 log_level:             $LOG_LEVEL
 reconnect_max_backoff: $BACKOFF
 EOF
+
+if [ -n "$PYTHON_VENV" ]; then
+    echo "python_venv:           $PYTHON_VENV" >> "$CONFIG_FILE"
+fi
 
 chmod 640 "$CONFIG_FILE"
 echo " done"

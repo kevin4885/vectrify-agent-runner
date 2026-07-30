@@ -26,10 +26,10 @@ type Runner struct {
 }
 
 // New creates a Runner with executors scoped to workspaceRoot.
-func New(workspaceRoot string, log *slog.Logger) *Runner {
+func New(workspaceRoot string, pythonVenv string, log *slog.Logger) *Runner {
 	return &Runner{
 		fileOps: executor.NewFileOps(workspaceRoot),
-		shell:   executor.NewShell(workspaceRoot, log),
+		shell:   executor.NewShell(workspaceRoot, pythonVenv, log),
 		log:     log,
 	}
 }

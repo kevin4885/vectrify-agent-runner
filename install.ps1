@@ -142,6 +142,7 @@ function Install-VectrifyRunner {
         if ($bs -match '^\d+$' -and [int]$bs -gt 0) { $backoff = [int]$bs; break }
         Write-Host "  Must be a positive integer." -ForegroundColor Yellow
     }
+    $pythonVenv = (Read-Host "  Python venv path (optional — leave blank to skip)").Trim()
 
     $allowShellYaml = if ($allowShell) { "true" } else { "false" }
 
@@ -150,6 +151,7 @@ function Install-VectrifyRunner {
     Write-Host "  workspace : $workspaceRoot"
     Write-Host "  key       : $($runnerKey.Substring(0,[Math]::Min(8,$runnerKey.Length)))..."
     Write-Host "  shell     : $allowShellYaml  |  log: $logLevel  |  backoff: ${backoff}s"
+    if ($pythonVenv) { Write-Host "  venv      : $pythonVenv" }
     Write-Host ""
     if (-not (Ask-YesNo "Proceed?" $true)) { if ($downloaded) { Remove-Item $src -EA 0 }; return }
     Write-Host ""
@@ -162,7 +164,7 @@ function Install-VectrifyRunner {
 
     Write-Host "  [2/5] Writing config..."      -NoNewline
     New-Item -ItemType Directory -Force $ConfigDir | Out-Null
-    @"
+    $configContent = @"
 api_url:               wss://api.vectrify.ai/api/v1/runner/ws
 runner_key:            $runnerKey
 workspace_root:        $workspaceRoot
@@ -170,7 +172,11 @@ allow_shell:           $allowShellYaml
 log_level:             $logLevel
 reconnect_max_backoff: $backoff
 log_file:              $LogFile
-"@ | Set-Content -Encoding UTF8 $ConfigFile
+"@
+    if ($pythonVenv) {
+        $configContent += "`npython_venv:           $pythonVenv"
+    }
+    $configContent | Set-Content -Encoding UTF8 $ConfigFile
     Write-Host " done" -ForegroundColor Green
 
     Write-Host "  [3/5] Registering service..." -NoNewline
