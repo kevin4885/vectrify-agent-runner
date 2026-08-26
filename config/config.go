@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -54,6 +55,13 @@ type Config struct {
 	// When empty, logs go to stdout (fine for terminals and Linux/macOS services).
 	// Set automatically by install.ps1 on Windows since services have no stdout.
 	LogFile string `yaml:"log_file"`
+
+	// ConfigPath is the absolute path this config was loaded from. Not part of
+	// the YAML file itself (yaml:"-") — set by Load() so the running process
+	// can rewrite its own config later (e.g. the update_key command self-updates
+	// runner_key in place without needing root, since the file is already
+	// owned by the user this process runs as).
+	ConfigPath string `yaml:"-"`
 }
 
 // Load reads the config from the given path, applying defaults for
@@ -74,7 +82,52 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.applyDefaults()
+
+	abs, err := filepath.Abs(path)
+	if err == nil {
+		cfg.ConfigPath = abs
+	} else {
+		cfg.ConfigPath = path
+	}
+
 	return &cfg, nil
+}
+
+// UpdateRunnerKey rewrites the runner_key line in the config file on disk to
+// newKey, leaving every other line untouched, then updates the in-memory
+// value. Used by the update_key command so a live runner can rotate its own
+// key without any file permission issues — the process already owns this
+// file (it was chown'd to the running user at install time).
+func (c *Config) UpdateRunnerKey(newKey string) error {
+	if c.ConfigPath == "" {
+		return fmt.Errorf("config path is unknown; cannot self-update")
+	}
+	data, err := os.ReadFile(c.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("reading config file %q: %w", c.ConfigPath, err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	found := false
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+		if strings.HasPrefix(trimmed, "runner_key:") {
+			lines[i] = "runner_key:            " + newKey
+			found = true
+			break
+		}
+	}
+	if !found {
+		lines = append(lines, "runner_key:            "+newKey)
+	}
+
+	out := strings.Join(lines, "\n")
+	if err := os.WriteFile(c.ConfigPath, []byte(out), 0600); err != nil {
+		return fmt.Errorf("writing config file %q: %w", c.ConfigPath, err)
+	}
+
+	c.RunnerKey = newKey
+	return nil
 }
 
 // DefaultConfigPath returns the default location for the config file.

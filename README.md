@@ -122,6 +122,26 @@ Config is written by the installer. To change a setting, edit the file and resta
 
 ---
 
+## Rotating your key
+
+Generate a new key from **Settings → Runners → [your runner] → Rotate Key** in the Vectrify UI.
+
+- **Runner online:** applied automatically over its live connection — nothing else to do.
+- **Runner offline** (or on a version predating this feature): the UI shows a one-line fallback command for your platform. Run it on the machine hosting the runner:
+
+  ```bash
+  # macOS / Linux
+  curl -fsSLO https://github.com/kevin4885/vectrify-agent-runner/releases/latest/download/install.sh && sudo bash install.sh --set-key vrun_NEWKEY...
+  ```
+  ```powershell
+  # Windows (Administrator PowerShell)
+  .\install.ps1 -SetKey vrun_NEWKEY...
+  ```
+
+  Both update `runner_key` in the existing config and restart the service — no manual file editing required.
+
+---
+
 ## Development
 
 ### Run against a local API

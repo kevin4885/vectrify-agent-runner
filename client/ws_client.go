@@ -281,7 +281,14 @@ func (c *Client) connect() error {
 					)
 				}
 			}()
-			c.runner.Dispatch(raw, send)
+			c.runner.Dispatch(raw, send, func() {
+				// Force this connection closed so the outer ReadMessage loop
+				// errors out and RunForever immediately reconnects, picking up
+				// the (just-updated) runner key from cfg. Safe to call multiple
+				// times / concurrently — Close() on an already-closed conn is a
+				// no-op error we don't care about.
+				_ = conn.Close()
+			})
 		}(raw)
 	}
 

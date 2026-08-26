@@ -5,9 +5,15 @@
 #
 # To install a second instance for a different Vectrify account:
 #   .\install.ps1 -InstanceName Account2
+#
+# To update an existing install's key and restart the service (fallback for
+# when the runner is offline during key rotation — if it's online, rotating
+# a key in the Vectrify UI applies live with no action needed here):
+#   .\install.ps1 -SetKey vrun_...
 
 param(
-    [string]$InstanceName = ""
+    [string]$InstanceName = "",
+    [string]$SetKey = ""
 )
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -40,6 +46,31 @@ function Install-VectrifyRunner {
     }
 
     $ErrorActionPreference = "Stop"
+
+    # ── -SetKey: update an existing install's key and restart, then exit ──────
+    if ($SetKey) {
+        if ($SetKey -notmatch '^vrun_.+') {
+            Write-Host "  ERROR: key must start with 'vrun_'" -ForegroundColor Red
+            return
+        }
+        if (-not (Test-Path $ConfigFile)) {
+            Write-Host "  ERROR: no existing install found at $ConfigFile - run a normal install first." -ForegroundColor Red
+            return
+        }
+        Write-Host ""
+        Write-Host "  Updating runner_key..." -NoNewline
+        (Get-Content $ConfigFile) -replace '^\s*runner_key:.*', "runner_key:            $SetKey" |
+            Set-Content -Encoding UTF8 $ConfigFile
+        Write-Host " done" -ForegroundColor Green
+
+        Write-Host "  Restarting service..." -NoNewline
+        Restart-Service $ServiceName -Force
+        Write-Host " done" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "  Key updated and service restarted." -ForegroundColor Cyan
+        Write-Host ""
+        return
+    }
 
     Write-Host ""
     Write-Host "  Vectrify Agent Runner - Installer" -ForegroundColor Cyan

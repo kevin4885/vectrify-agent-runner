@@ -79,7 +79,7 @@ func main() {
 		"allow_shell",    cfg.AllowShell,
 	)
 
-	r := runner.New(cfg.WorkspaceRoot, log)
+	r := runner.New(cfg, log)
 	c := client.New(cfg, r, log)
 	runService(log, c)
 }

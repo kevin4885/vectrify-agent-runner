@@ -97,7 +97,21 @@ All messages are JSON over the WebSocket.
   "path": "/absolute/path/on/runner", "max_bytes": 104857600, "overwrite": false }
 { "cmd_id": "uuid", "type": "file_transfer", "direction": "upload",   "url": "<presigned-PUT>",
   "path": "/absolute/path/on/runner", "max_bytes": 104857600 }
+{ "cmd_id": "uuid", "type": "update_key", "new_key": "vrun_..." }
 ```
+
+**update_key notes:**
+- Rewrites `runner_key` in the runner's own `config.yaml` on disk (no root/elevated
+  access needed — the file is already owned by the user this process runs as)
+  and swaps the in-memory key, then closes the current WebSocket connection so
+  the client's existing reconnect loop immediately dials back in with the new
+  key. Applied live with zero downtime, no restart command needed.
+- API side: `POST /runners/{id}/rotate-key` calls this automatically when
+  `registry.is_connected(runner_id)` is true, and reports back `pushedLive` in
+  the response. If the runner is offline, or on a version that predates this
+  command (unknown cmd type → runner replies with an `error` message, or the
+  send simply times out), `pushedLive=false` and the caller must fall back to
+  `install.sh --set-key <key>` / `install.ps1 -SetKey <key>`.
 
 **file_transfer notes:**
 - `direction`: `"download"` = S3 → runner filesystem; `"upload"` = runner filesystem → S3.

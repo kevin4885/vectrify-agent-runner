@@ -6,6 +6,12 @@
 #
 # Usage:
 #   sudo ./install.sh
+#   sudo ./install.sh --set-key vrun_...   # update an existing install's key
+#                                            # and restart the service (fallback
+#                                            # for when the runner is offline —
+#                                            # if it's online, rotating a key in
+#                                            # the Vectrify UI applies live with
+#                                            # no action needed here)
 
 set -euo pipefail
 
@@ -60,6 +66,46 @@ CONFIG_FILE="$CONFIG_DIR/config.yaml"
 LOG_DIR="/Library/Logs/VectrifyRunner"
 LOG_FILE="$LOG_DIR/vectrify-runner.log"
 PLIST_PATH="/Library/LaunchDaemons/ai.vectrify.runner.plist"
+
+# ── --set-key: update an existing install's key and restart, then exit ────────
+# Fast path that needs no binary download — just rewrites runner_key in the
+# existing config and restarts the service. This is the fallback shown by the
+# Vectrify UI when a runner is offline (or on a version too old to support the
+# live update_key command) during key rotation.
+SET_KEY=""
+if [ "${1:-}" = "--set-key" ]; then
+    SET_KEY="${2:-}"
+    if [ -z "$SET_KEY" ]; then
+        echo "ERROR: --set-key requires a value, e.g. --set-key vrun_..." >&2
+        exit 1
+    fi
+    if [[ "$SET_KEY" != vrun_* ]]; then
+        echo "ERROR: key must start with 'vrun_'" >&2
+        exit 1
+    fi
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "ERROR: no existing install found at $CONFIG_FILE — run a normal install first." >&2
+        exit 1
+    fi
+
+    printf "  Updating runner_key..."
+    sed -i.bak -E "s|^([[:space:]]*runner_key:).*|\\1            $SET_KEY|" "$CONFIG_FILE"
+    rm -f "$CONFIG_FILE.bak"
+    echo " done"
+
+    printf "  Restarting service..."
+    if [ "$PLATFORM" = "linux" ]; then
+        systemctl restart vectrify-runner
+    elif [ "$PLATFORM" = "darwin" ]; then
+        launchctl stop  ai.vectrify.runner 2>/dev/null || true
+        sleep 1
+        launchctl start ai.vectrify.runner
+    fi
+    echo " done"
+    echo ""
+    echo "  Key updated and service restarted."
+    exit 0
+fi
 
 # write_darwin_plist creates the log directory (owned by $1), writes the
 # LaunchDaemon plist to run as user $1, and (re)loads it. Used by both the

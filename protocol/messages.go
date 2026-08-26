@@ -14,6 +14,11 @@
 //	shell         — run a shell command (bash or PowerShell), requires allow_shell=true
 //	git           — structured git operations
 //	file_transfer — copy a file between S3 (presigned URL) and the runner filesystem
+//	update_key    — rewrite runner_key in the local config file and reconnect
+//	                immediately with the new key (payload: {"new_key": "vrun_..."}).
+//	                Lets a key rotation apply live with zero downtime when the
+//	                runner is currently connected; no restart or file access
+//	                required from the user.
 package protocol
 
 // ── Outbound (Runner → API) ────────────────────────────────────────────────────
