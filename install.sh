@@ -52,6 +52,63 @@ INSTALL_BIN="/usr/local/bin/vectrify-runner"
 CONFIG_DIR="/etc/vectrify-runner"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 
+# macOS-only: LaunchDaemon log location. The daemon runs as the installing
+# user (not root), so logs must live somewhere that user can write to.
+# /var/log is root-owned and not writable by regular users — using it here
+# causes launchd to fail the process at startup with EX_CONFIG (exit 78)
+# before a single line of runner code even executes.
+LOG_DIR="/Library/Logs/VectrifyRunner"
+LOG_FILE="$LOG_DIR/vectrify-runner.log"
+PLIST_PATH="/Library/LaunchDaemons/ai.vectrify.runner.plist"
+
+# write_darwin_plist creates the log directory (owned by $1), writes the
+# LaunchDaemon plist to run as user $1, and (re)loads it. Used by both the
+# fresh-install path and the update/repair path so that re-running this
+# installer always fixes a previously-broken plist or log directory.
+write_darwin_plist() {
+    local plist_user="$1"
+
+    mkdir -p "$LOG_DIR"
+    chown "$plist_user" "$LOG_DIR"
+    chmod 755 "$LOG_DIR"
+    # Pre-create the log file too so ownership is right from the first write.
+    touch "$LOG_FILE"
+    chown "$plist_user" "$LOG_FILE"
+
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+
+    cat > "$PLIST_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.vectrify.runner</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$INSTALL_BIN</string>
+        <string>--config</string>
+        <string>$CONFIG_FILE</string>
+    </array>
+    <key>UserName</key>
+    <string>$plist_user</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$LOG_FILE</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG_FILE</string>
+</dict>
+</plist>
+EOF
+
+    chmod 644 "$PLIST_PATH"
+    launchctl load "$PLIST_PATH"
+}
+
 # ── Banner ────────────────────────────────────────────────────────────────────
 echo ""
 echo "  Vectrify Agent Runner - Installer"
@@ -106,12 +163,25 @@ if [ -f "$CONFIG_FILE" ]; then
     fi
     sleep 2
     install -m 755 "$SRC" "$INSTALL_BIN"
+    echo " done"
+
     if [ "$PLATFORM" = "linux" ]; then
         systemctl start vectrify-runner
     elif [ "$PLATFORM" = "darwin" ]; then
-        launchctl start ai.vectrify.runner
+        # Repair the plist and log directory on every update too — this fixes
+        # installs created by older/broken versions of this installer (e.g.
+        # a log path the daemon user couldn't write to) without requiring a
+        # manual uninstall/reinstall.
+        printf "  Repairing launchd daemon..."
+        REPAIR_USER="${ORIGINAL_USER:-root}"
+        if [ -f "$PLIST_PATH" ]; then
+            EXISTING_USER="$(defaults read "$PLIST_PATH" UserName 2>/dev/null || true)"
+            if [ -n "$EXISTING_USER" ]; then REPAIR_USER="$EXISTING_USER"; fi
+        fi
+        write_darwin_plist "$REPAIR_USER"
+        echo " done"
     fi
-    echo " done"
+
     echo ""
     if [ "$DOWNLOADED" = "true" ]; then rm -f "$TMP_BIN"; fi
     exit 0
@@ -292,55 +362,22 @@ EOF
 
 elif [ "$PLATFORM" = "darwin" ]; then
 
-    PLIST_PATH="/Library/LaunchDaemons/ai.vectrify.runner.plist"
     # Determine UserName for the plist — prefer the invoking user, fall back to root.
     PLIST_USER="${ORIGINAL_USER:-root}"
 
     printf "  [3/4] Installing launchd daemon..."
-
-    # Unload any existing instance before replacing the plist.
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
-
-    cat > "$PLIST_PATH" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>ai.vectrify.runner</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$INSTALL_BIN</string>
-        <string>--config</string>
-        <string>$CONFIG_FILE</string>
-    </array>
-    <key>UserName</key>
-    <string>$PLIST_USER</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/var/log/vectrify-runner.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/vectrify-runner.log</string>
-</dict>
-</plist>
-EOF
-
-    chmod 644 "$PLIST_PATH"
+    write_darwin_plist "$PLIST_USER"
     echo " done"
 
-    printf "  [4/4] Loading service..."
-    launchctl load "$PLIST_PATH"
+    printf "  [4/4] Verifying startup..."
+    sleep 2
     echo " done"
 
     echo ""
     echo "  Manage with:"
     echo "    sudo launchctl start  ai.vectrify.runner"
     echo "    sudo launchctl stop   ai.vectrify.runner"
-    echo "    tail -f /var/log/vectrify-runner.log"
+    echo "    tail -f $LOG_FILE"
 
 fi
 

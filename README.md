@@ -18,12 +18,19 @@ The runner makes a **single outbound WebSocket connection** to the Vectrify API.
 2. Give it a name (e.g. `dev-laptop`, `staging-server`)
 3. Copy the `vrun_...` key — it is shown **exactly once and never again**
 
-### Step 2 — Run the one-line installer
+### Step 2 — Run the installer
 
-**macOS / Linux:**
+**macOS / Linux — download the script, then run it with `sudo` as a separate step:**
 ```bash
-bash <(curl -fsSL https://github.com/kevin4885/vectrify-agent-runner/releases/latest/download/install.sh)
+curl -fsSLO https://github.com/kevin4885/vectrify-agent-runner/releases/latest/download/install.sh
+sudo bash install.sh
 ```
+
+> ⚠️ **Do not** run this as `sudo bash <(curl -fsSL ...)` or `curl ... | sudo bash`.
+> - Process substitution (`<(...)`) breaks under `sudo` on macOS/Linux with `bash: /dev/fd/NN: Bad file descriptor` — `sudo` closes inherited file descriptors before the subshell can read from them.
+> - Piping directly into `sudo bash` can hang or misbehave on the interactive prompts because `sudo`'s stdin is the pipe, not your terminal.
+>
+> Downloading first and running the local file with `sudo bash install.sh` avoids both problems and is the only supported method.
 
 **Windows — open PowerShell as Administrator, then:**
 ```powershell
@@ -43,14 +50,16 @@ It then installs the binary, writes the config, and registers and starts a syste
 |---|---|---|---|
 | Binary | `C:\Program Files\VectrifyRunner\vectrify-runner.exe` | `/usr/local/bin/vectrify-runner` | `/usr/local/bin/vectrify-runner` |
 | Config | `C:\ProgramData\VectrifyRunner\config.yaml` | `/etc/vectrify-runner/config.yaml` | `/etc/vectrify-runner/config.yaml` |
-| Logs | `C:\ProgramData\VectrifyRunner\vectrify-runner.log` | `journalctl -u vectrify-runner` | `/var/log/vectrify-runner.log` |
-| Service | Windows Service (`VectrifyRunner`) | systemd (`vectrify-runner`) | launchd (`ai.vectrify.runner`) |
+| Logs | `C:\ProgramData\VectrifyRunner\vectrify-runner.log` | `journalctl -u vectrify-runner` | `/Library/Logs/VectrifyRunner/vectrify-runner.log` |
+| Service | Windows Service (`VectrifyRunner`) | systemd (`vectrify-runner`), runs as invoking user | launchd (`ai.vectrify.runner`), runs as invoking user |
+
+On macOS and Linux the daemon runs as **the user who ran the installer** (not root), matching least-privilege — even with `allow_shell: true`, shell commands only ever run with that user's own permissions.
 
 ---
 
 ## Updating
 
-Re-run the same one-liner. If a config file already exists the installer detects it, skips all prompts, and just swaps the binary and restarts the service.
+Re-run the same installer commands from Step 2. If a config file already exists the installer detects it, skips all prompts, and just swaps the binary and restarts the service (on macOS this also repairs the launchd plist/log directory if a previous install left them in a broken state).
 
 The runner also **updates itself automatically** — on startup and every 24 hours it checks GitHub for a newer release and applies it in the background with no user interaction needed.
 
@@ -86,7 +95,7 @@ sudo launchctl start  ai.vectrify.runner
 sudo launchctl stop   ai.vectrify.runner
 
 # View logs
-tail -f /var/log/vectrify-runner.log
+tail -f /Library/Logs/VectrifyRunner/vectrify-runner.log
 ```
 
 ---
@@ -165,6 +174,19 @@ GitHub Actions builds all 5 binaries and publishes them as a GitHub Release auto
 ---
 
 ## Troubleshooting
+
+**`bash: /dev/fd/NN: Bad file descriptor` when installing**
+You ran the installer as `sudo bash <(curl -fsSL ...)`. Process substitution doesn't survive `sudo`'s fd handling. Download the script first, then run it: `curl -fsSLO .../install.sh && sudo bash install.sh` (see Step 2 above).
+
+**Install hangs or seems to do nothing after `curl ... | sudo bash`**
+Piping directly into `sudo bash` puts the pipe (not your terminal) on `sudo`'s stdin, which can hang the interactive prompts. Use the two-step download-then-run pattern instead.
+
+**macOS: `launchctl print system/ai.vectrify.runner` shows `last exit code = 78: EX_CONFIG` and no log file appears**
+This means launchd could not start the process at all — typically because the configured log path wasn't writable by the daemon's user (this affected installs from versions of `install.sh` predating the `/Library/Logs/VectrifyRunner` fix, which pointed at root-owned `/var/log`). Re-run the installer — the update path now repairs the plist and log directory automatically on every run:
+```bash
+curl -fsSLO https://github.com/kevin4885/vectrify-agent-runner/releases/latest/download/install.sh
+sudo bash install.sh
+```
 
 **`runner_key must start with 'vrun_'`**
 Re-copy the key from Settings → Runners in the Vectrify UI.

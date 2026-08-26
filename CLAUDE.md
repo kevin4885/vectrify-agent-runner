@@ -150,8 +150,11 @@ go build -o vectrify-runner.exe .
 ### One-liner (recommended — downloads binary automatically from latest release)
 
 ```bash
-# macOS / Linux
-bash <(curl -fsSL https://github.com/vectrify/vectrify-agent-runner/releases/latest/download/install.sh)
+# macOS / Linux — download first, then run with sudo (do NOT use
+# `sudo bash <(curl ...)` or `curl ... | sudo bash` — both break under sudo,
+# see README.md Troubleshooting)
+curl -fsSLO https://github.com/kevin4885/vectrify-agent-runner/releases/latest/download/install.sh
+sudo bash install.sh
 ```
 
 ```powershell
@@ -177,6 +180,11 @@ and reconnect_max_backoff. Config is written to:
 - Linux   : /etc/vectrify-runner/config.yaml
 - macOS   : /etc/vectrify-runner/config.yaml
 
+On macOS/Linux the service runs as the invoking (`sudo`) user, not root — see
+Security invariant #4 below. Re-running `install.sh` on an existing install
+also repairs the macOS launchd plist and log directory if a previous install
+left them broken (e.g. a log path the daemon user couldn't write to).
+
 ## Releasing
 
 ```bash
@@ -196,7 +204,12 @@ as assets on the GitHub Release. The one-liner install commands always pull from
 1. **Path containment** — `executor/file_ops.go` rejects any path outside `workspace_root` before reading or writing. No exceptions.
 2. **Shell gating** — `runner_shell` commands are blocked at the API level if `allow_shell=false`; the runner also checks before executing.
 3. **Outbound-only networking** — the runner makes no inbound connections; only the one outbound WebSocket to the API.
-4. **No privilege escalation** — run as a regular user, never root/admin.
+4. **No privilege escalation** — run as a regular user, never root/admin. On macOS
+   and Linux the daemon runs as the user who invoked the installer (via `sudo`),
+   never as `root`, even though the installer itself must be run with `sudo` to
+   write system-level config/service files. macOS logs live under
+   `/Library/Logs/VectrifyRunner/` (owned by that user) rather than root-owned
+   `/var/log/`, so the daemon can actually write its own log file.
 5. **Key never logged** — `runner_key` is used only in the WebSocket URL; it is never written to log files.
 
 ---
