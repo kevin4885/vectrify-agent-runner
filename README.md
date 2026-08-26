@@ -188,6 +188,13 @@ curl -fsSLO https://github.com/kevin4885/vectrify-agent-runner/releases/latest/d
 sudo bash install.sh
 ```
 
+**Log shows `Error loading config: ... permission denied` for `/etc/vectrify-runner/config.yaml`**
+The service runs as a regular (non-root) user, but the config file was left owned by `root` with no group/other access by an older installer version — so the daemon can't even read its own config and exits immediately. Re-run the installer; the update path now `chown`s the config directory/file to the correct user automatically:
+```bash
+curl -fsSLO https://github.com/kevin4885/vectrify-agent-runner/releases/latest/download/install.sh
+sudo bash install.sh
+```
+
 **`runner_key must start with 'vrun_'`**
 Re-copy the key from Settings → Runners in the Vectrify UI.
 

@@ -209,7 +209,11 @@ as assets on the GitHub Release. The one-liner install commands always pull from
    never as `root`, even though the installer itself must be run with `sudo` to
    write system-level config/service files. macOS logs live under
    `/Library/Logs/VectrifyRunner/` (owned by that user) rather than root-owned
-   `/var/log/`, so the daemon can actually write its own log file.
+   `/var/log/`, so the daemon can actually write its own log file. The config
+   directory/file (`/etc/vectrify-runner/`) is likewise `chown`ed to that same
+   user (mode 700/600) — otherwise the root-owned config from earlier installer
+   versions is unreadable by the non-root service user and the daemon fails
+   immediately with "permission denied" on startup.
 5. **Key never logged** — `runner_key` is used only in the WebSocket URL; it is never written to log files.
 
 ---

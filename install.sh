@@ -165,6 +165,25 @@ if [ -f "$CONFIG_FILE" ]; then
     install -m 755 "$SRC" "$INSTALL_BIN"
     echo " done"
 
+    # Repair config ownership/permissions on every update — older versions of
+    # this installer left the config dir/file owned by root with no group/other
+    # access, which the service (running as a non-root user) cannot read at
+    # all, causing "permission denied" on startup. Determine which user the
+    # service actually runs as, then chown the config to match.
+    printf "  Repairing config permissions..."
+    CONFIG_OWNER="${ORIGINAL_USER:-root}"
+    if [ "$PLATFORM" = "linux" ] && [ -f /etc/systemd/system/vectrify-runner.service ]; then
+        EXISTING_UNIT_USER="$(grep -E '^User=' /etc/systemd/system/vectrify-runner.service 2>/dev/null | cut -d= -f2)"
+        if [ -n "$EXISTING_UNIT_USER" ]; then CONFIG_OWNER="$EXISTING_UNIT_USER"; fi
+    elif [ "$PLATFORM" = "darwin" ] && [ -f "$PLIST_PATH" ]; then
+        EXISTING_PLIST_USER="$(defaults read "$PLIST_PATH" UserName 2>/dev/null || true)"
+        if [ -n "$EXISTING_PLIST_USER" ]; then CONFIG_OWNER="$EXISTING_PLIST_USER"; fi
+    fi
+    chown -R "$CONFIG_OWNER" "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    chmod 600 "$CONFIG_FILE"
+    echo " done"
+
     if [ "$PLATFORM" = "linux" ]; then
         systemctl start vectrify-runner
     elif [ "$PLATFORM" = "darwin" ]; then
@@ -173,12 +192,7 @@ if [ -f "$CONFIG_FILE" ]; then
         # a log path the daemon user couldn't write to) without requiring a
         # manual uninstall/reinstall.
         printf "  Repairing launchd daemon..."
-        REPAIR_USER="${ORIGINAL_USER:-root}"
-        if [ -f "$PLIST_PATH" ]; then
-            EXISTING_USER="$(defaults read "$PLIST_PATH" UserName 2>/dev/null || true)"
-            if [ -n "$EXISTING_USER" ]; then REPAIR_USER="$EXISTING_USER"; fi
-        fi
-        write_darwin_plist "$REPAIR_USER"
+        write_darwin_plist "$CONFIG_OWNER"
         echo " done"
     fi
 
@@ -303,7 +317,6 @@ echo " done"
 # ── Step 2: Write config ──────────────────────────────────────────────────────
 printf "  [2/4] Writing config..."
 mkdir -p "$CONFIG_DIR"
-chmod 750 "$CONFIG_DIR"
 
 cat > "$CONFIG_FILE" <<EOF
 api_url:               wss://api.vectrify.ai/api/v1/runner/ws
@@ -314,7 +327,14 @@ log_level:             $LOG_LEVEL
 reconnect_max_backoff: $BACKOFF
 EOF
 
-chmod 640 "$CONFIG_FILE"
+# The service (systemd on Linux, launchd on macOS) runs as the invoking user,
+# not root — chown the config dir/file to that user so the daemon can
+# actually read its own config. Locked to that user only (600) since the
+# file contains runner_key.
+CONFIG_OWNER="${ORIGINAL_USER:-root}"
+chown -R "$CONFIG_OWNER" "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
+chmod 600 "$CONFIG_FILE"
 echo " done"
 
 # ── Step 3: Register service ──────────────────────────────────────────────────
