@@ -1,4 +1,4 @@
-﻿// Package client manages the persistent WebSocket connection to the Vectrify API.
+// Package client manages the persistent WebSocket connection to the Vectrify API.
 // It handles authentication, the registration handshake, reconnection with
 // exponential backoff, and the bidirectional message loop.
 package client
@@ -10,7 +10,6 @@ import (
 	"math"
 	"net/http"
 	"runtime/debug"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -46,19 +45,66 @@ const (
 	// run simultaneously.  Prevents unbounded goroutine growth if the API sends a
 	// burst of commands (e.g. due to a server-side bug or replay).
 	maxDispatchConcurrency = 32
+
+	// staleCommandThreshold is how long a command may stay in-flight before the
+	// staleness monitor warns about it.  Set comfortably above maxShellTimeout
+	// (10 minutes, runner/runner.go) so a healthy long-running shell command
+	// never trips this — it exists to catch commands wedged past their own
+	// timeout (e.g. the descendant-process pipe-inheritance hang this dispatch
+	// layer was previously vulnerable to), not to police normal durations.
+	staleCommandThreshold = 15 * time.Minute
+
+	// staleCheckInterval is how often the staleness monitor scans the registry.
+	staleCheckInterval = 30 * time.Second
+
+	// rejectionLogTopN is how many of the oldest in-flight commands to include
+	// in the concurrency-limit rejection log line.
+	rejectionLogTopN = 5
 )
 
 // Client manages one persistent WebSocket connection to the Vectrify API.
 type Client struct {
-	cfg            *config.Config
-	runner         *runner.Runner
-	log            *slog.Logger
-	activeCommands atomic.Int64 // count of in-flight dispatch goroutines
+	cfg      *config.Config
+	runner   *runner.Runner
+	log      *slog.Logger
+	inflight *inflightRegistry // single source of truth for active dispatch count + detail
 }
 
-// New creates a Client.
+// New creates a Client and starts its background staleness monitor.
+// The monitor runs for the lifetime of the process (New is called exactly
+// once from main.go) and is intentionally not tied to any one WebSocket
+// connection: in-flight dispatch goroutines (and the registry entries they
+// hold) survive reconnects, so a stale-command warning must too.
 func New(cfg *config.Config, r *runner.Runner, log *slog.Logger) *Client {
-	return &Client{cfg: cfg, runner: r, log: log}
+	c := &Client{cfg: cfg, runner: r, log: log, inflight: newInflightRegistry()}
+	go c.monitorStale()
+	return c
+}
+
+// monitorStale periodically scans the in-flight registry for commands that
+// have been running longer than staleCommandThreshold and warns about them.
+// This is the early-warning signal for a wedged dispatch goroutine: it fires
+// long before enough slots are wedged to start rejecting new commands.
+//
+// Anti-spam: inflightRegistry.checkStale marks each entry as "warned" the
+// first time it crosses the threshold, so a command stuck for hours produces
+// exactly one WARN, not one every 30s. Runs for the life of the process —
+// there is nothing to stop, so no lifecycle management is needed beyond the
+// one goroutine started in New().
+func (c *Client) monitorStale() {
+	ticker := time.NewTicker(staleCheckInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		stale := c.inflight.checkStale(staleCommandThreshold)
+		for _, s := range stale {
+			c.log.Warn("dispatch: command has been in-flight longer than expected, possible wedged slot",
+				"cmd_id", s.CmdID,
+				"type", s.CmdType,
+				"age", s.Age.Round(time.Second).String(),
+				"threshold", staleCommandThreshold.String(),
+			)
+		}
+	}
 }
 
 // Drain blocks until all in-flight dispatch goroutines have finished or
@@ -67,13 +113,15 @@ func New(cfg *config.Config, r *runner.Runner, log *slog.Logger) *Client {
 func (c *Client) Drain(timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if c.activeCommands.Load() == 0 {
+		if c.inflight.count() == 0 {
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	oldest := c.inflight.snapshot()
 	c.log.Warn("drain timeout: exiting with in-flight commands",
-		"active", c.activeCommands.Load(),
+		"active", c.inflight.count(),
+		"oldest", summarizeOldest(oldest, rejectionLogTopN),
 	)
 }
 
@@ -192,7 +240,7 @@ func (c *Client) connect() error {
 	// SetWriteDeadline is set before every write so a half-open TCP connection
 	// (reads fail but kernel send buffer still accepts bytes) cannot block the
 	// writer indefinitely, which would hang <-writerDone and freeze RunForever.
-	writeCh    := make(chan interface{}, 64)
+	writeCh := make(chan interface{}, 64)
 	stopWriter := make(chan struct{})
 	writerDone := make(chan struct{})
 	go func() {
@@ -257,22 +305,40 @@ func (c *Client) connect() error {
 
 		// Dispatch each command in its own goroutine so the recv loop is never
 		// blocked by a long-running shell command.  A deferred recover ensures a
-		// panicking handler never crashes the process.  The semaphore limits
-		// concurrent goroutines; if full the command is rejected with an error so
-		// the API caller gets a clear response rather than a silent queue build-up.
+		// panicking handler never crashes the process.  The concurrency limit
+		// check below caps how many of these goroutines may run at once; if full
+		// the command is rejected with an error so the API caller gets a clear
+		// response rather than a silent queue build-up.
 		cmdID := raw.CmdID()
-		if c.activeCommands.Load() >= maxDispatchConcurrency {
-			c.log.Warn("dispatch: concurrency limit reached, rejecting command", "cmd_id", cmdID)
+		cmdType := raw.Type()
+		if active := c.inflight.count(); active >= maxDispatchConcurrency {
+			oldest := c.inflight.snapshot()
+			c.log.Warn("dispatch: concurrency limit reached, rejecting command",
+				"cmd_id", cmdID,
+				"type", cmdType,
+				"active", active,
+				"limit", maxDispatchConcurrency,
+				"oldest_inflight", summarizeOldest(oldest, rejectionLogTopN),
+			)
 			send(protocol.ErrorMsg{
 				CmdID:   cmdID,
 				Type:    "error",
-				Message: fmt.Sprintf("runner busy: concurrency limit of %d reached", maxDispatchConcurrency),
+				Message: fmt.Sprintf("runner busy: concurrency limit of %d reached (active=%d)", maxDispatchConcurrency, active),
 			})
 			continue
 		}
-		c.activeCommands.Add(1)
+		// add() also tolerates (and logs) a duplicate cmd_id rather than
+		// silently corrupting the registry; see inflightRegistry.add.
+		if dup := c.inflight.add(cmdID, cmdType); dup {
+			c.log.Warn("dispatch: duplicate cmd_id received while original still in-flight",
+				"cmd_id", cmdID, "type", cmdType,
+			)
+		}
 		go func(raw protocol.RawCommand) {
-			defer c.activeCommands.Add(-1)
+			// Unconditional: pairs with the add() above regardless of
+			// duplicates, panics, or which handler branch runs, so no
+			// registry entry (and no active-count unit) can ever leak.
+			defer c.inflight.remove(cmdID)
 			defer func() {
 				if p := recover(); p != nil {
 					c.log.Error("dispatch panic recovered",
