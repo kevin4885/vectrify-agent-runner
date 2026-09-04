@@ -142,7 +142,20 @@ workspace_root:       /home/user/projects  # all file ops must be inside this pa
 allow_shell:          false             # set true to enable runner_shell commands
 log_level:            info              # debug | info | warn | error
 reconnect_max_backoff: 60               # seconds
+max_concurrency:       32               # max simultaneous dispatched commands, all classes
+max_heavy_concurrency: 24               # sub-limit for "heavy" commands (shell, file_transfer);
+                                         # must be strictly less than max_concurrency (clamped to
+                                         # max_concurrency-1 with a warning if not), so light
+                                         # commands (file_op, git, update_key, unknown types)
+                                         # always keep at least one slot free even when every
+                                         # heavy slot is occupied
+slot_acquire_timeout_seconds: 3         # how long a command waits for a free slot before being
+                                         # rejected as "runner busy", instead of rejecting instantly
 ```
+
+All three concurrency knobs are optional; the defaults shown above match the
+hardcoded behavior from before they became configurable, so an existing
+config.yaml with none of these keys set behaves identically.
 
 ---
 

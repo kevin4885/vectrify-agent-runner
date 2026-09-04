@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -21,7 +22,8 @@ import (
 // duplicates.
 type inflightEntry struct {
 	cmdType     string
-	start       time.Time // time of the *first* dispatch for this cmd_id
+	class       commandClass // derived once from cmdType at insertion time (see classifyCommand)
+	start       time.Time    // time of the *first* dispatch for this cmd_id
 	refCount    int
 	warnedStale bool // see inflightRegistry.checkStale
 }
@@ -36,13 +38,39 @@ type inflightSnapshot struct {
 
 // inflightRegistry is a concurrency-safe registry of currently-dispatching
 // commands. It is the single source of truth for "how many commands are
-// running right now" and "which ones" — it replaces the old bare
-// atomic.Int64 counter, which could only ever answer the first question.
-// count() is derived from the registry contents rather than tracked
-// separately, so the two can never drift out of sync.
+// running right now" (in total, and per commandClass) and "which ones" — it
+// replaces the old bare atomic.Int64 counter, which could only ever answer
+// the first question for the total. count(), countsLocked(), and acquire()
+// all derive their numbers from r.entries rather than tracking a second,
+// separately-maintained counter, so admission control and the numbers
+// reported in logs/Drain/staleness warnings can never drift apart.
+//
+// acquire() is the capacity-gated entry point used by the dispatch hand-off
+// path (client/ws_client.go): it waits, bounded by a caller-supplied
+// context, for a slot to free rather than either rejecting instantly or
+// polling in a sleep loop. Waiting is implemented with a channel that is
+// closed and replaced every time remove() frees up any capacity (see
+// waitCh below) — every current waiter wakes on a select, rechecks capacity
+// under the lock, and either wins the slot or loses the race and waits
+// again. This means waiters are woken in a broadcast, NOT strict FIFO order
+// — whichever goroutine's recheck happens to run first under the mutex
+// wins, regardless of how long it has been waiting. That is an accepted
+// trade-off for this use case (bounded 2-3s waits absorbing normal command
+// bursts, not a fairness-critical scheduler) in exchange for a much simpler
+// implementation than a proper FIFO wait queue.
 type inflightRegistry struct {
 	mu      sync.Mutex
 	entries map[string]*inflightEntry
+
+	// waitCh is closed and replaced (never just closed-and-left) every time
+	// remove() frees capacity, so every acquire() call currently blocked in
+	// `select { case <-wake: ... }` observes the close and re-checks
+	// capacity under the lock. Replacing (not reusing) the channel means a
+	// waiter that already captured the old value under the lock cannot miss
+	// a subsequent close: it either already grabbed the freed slot when it
+	// last held the lock, or it is holding a reference to the exact channel
+	// that will be closed on the next remove().
+	waitCh chan struct{}
 
 	// now supplies the current time. Overridable in tests so staleness
 	// checks are deterministic instead of relying on time.Sleep.
@@ -52,49 +80,147 @@ type inflightRegistry struct {
 func newInflightRegistry() *inflightRegistry {
 	return &inflightRegistry{
 		entries: make(map[string]*inflightEntry),
+		waitCh:  make(chan struct{}),
 		now:     time.Now,
 	}
 }
 
-// add registers a dispatch for cmdID/cmdType and returns true if this is a
-// duplicate — i.e. cmdID was already in-flight. Every add() call, duplicate
-// or not, must be paired with exactly one remove(cmdID) call (typically via
-// an unconditional defer at the call site) to keep refCount balanced.
-//
-// A duplicate add() keeps the *original* entry's cmdType, start time, and
-// warnedStale flag — it does not create a second entry or reset the clock.
-// This is deliberate: the entry's age must reflect how long the original
-// (still-running) dispatch has been in flight, which is exactly the signal
-// this registry exists to preserve. The practical effect is that once a
-// wedged original has been warned as stale, an incoming duplicate for the
-// same id will not trigger a second stale warning of its own — it shares
-// the original's warned state, consistent with "one WARN per stuck cmd_id".
-func (r *inflightRegistry) add(cmdID, cmdType string) (duplicate bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if e, exists := r.entries[cmdID]; exists {
-		e.refCount++
-		return true
+// countsLocked returns (global, heavy) active counts derived from the
+// current registry contents. Callers must hold r.mu.
+func (r *inflightRegistry) countsLocked() (global, heavy int) {
+	for _, e := range r.entries {
+		global += e.refCount
+		if e.class == classHeavy {
+			heavy += e.refCount
+		}
 	}
-	r.entries[cmdID] = &inflightEntry{cmdType: cmdType, start: r.now(), refCount: 1}
-	return false
+	return global, heavy
+}
+
+// acquireOutcome is the result of an acquire() call. blockedBy, global, and
+// heavy are only meaningful when OK is false — they capture which
+// constraint was binding (and the counts at that moment) purely for the
+// caller's rejection log/error message; the registry itself has already
+// made its decision by the time this is returned.
+type acquireOutcome struct {
+	OK        bool
+	Duplicate bool
+	BlockedBy string // "global" | "heavy" — set only when OK is false
+	Global    int
+	Heavy     int
+}
+
+// acquire reserves one dispatch slot for cmdID/cmdType, waiting (bounded by
+// ctx) for a slot to free if none is available right now. It never polls:
+// the wait is a select on ctx.Done() and the shared waitCh broadcast
+// described on inflightRegistry. Every call that returns OK == true —
+// including duplicates — reserves exactly one unit of capacity that MUST be
+// released with exactly one matching remove(cmdID) call, typically via an
+// unconditional defer at the call site (same contract the old add()/remove()
+// pair had).
+//
+// class is derived from cmdType via classifyCommand internally (not passed
+// in as a separate parameter) so the two can never disagree — a caller
+// cannot accidentally pass a cmdType/class pair where the class doesn't
+// actually correspond to classifyCommand(cmdType).
+//
+// Duplicate cmd_id handling: a duplicate is subjected to EXACTLY the same
+// capacity check as a brand new command — it is NOT admitted
+// unconditionally regardless of capacity. This mirrors the pre-acquire()
+// dispatch path (client/ws_client.go, prior commit), where the capacity
+// check ran before add() was ever called, so a duplicate arriving while the
+// registry was already full was rejected exactly like any other command.
+// It matters because a duplicate still increments refCount, which
+// countsLocked() includes in the global/heavy totals — i.e. a duplicate
+// really does consume one additional unit of tracked capacity, not a free
+// ride on the original's slot. Treating duplicates as capacity-exempt would
+// let a buggy or replaying API resend the same cmd_id N times while the
+// original is still running and get N executions admitted regardless of
+// MaxConcurrency — precisely the unbounded-growth failure this mechanism
+// exists to prevent. The only special-casing is that once capacity IS
+// available, a duplicate joins the existing entry (increment refCount)
+// instead of creating a second map entry, per inflightEntry's doc comment.
+func (r *inflightRegistry) acquire(ctx context.Context, cmdID, cmdType string, maxGlobal, maxHeavy int) acquireOutcome {
+	for {
+		r.mu.Lock()
+
+		// effectiveClass is the class the capacity check below is measured
+		// against. For a duplicate, this MUST be the original entry's own
+		// class (e.class), NOT classifyCommand(cmdType) of the incoming
+		// duplicate — a cmd_id reused with a different type (however
+		// anomalous) must still be accounted against whichever class it is
+		// actually going to occupy (the existing entry it joins), or the
+		// heavy/light counts silently drift from reality: a "shell"
+		// duplicate of an existing light entry would run heavy work without
+		// ever consuming a heavy slot, and a light duplicate of a heavy
+		// entry would inflate the heavy count past maxHeavy.
+		existing, isDuplicate := r.entries[cmdID]
+		effectiveClass := classifyCommand(cmdType)
+		if isDuplicate {
+			effectiveClass = existing.class
+		}
+
+		global, heavy := r.countsLocked()
+		globalFull := global >= maxGlobal
+		heavyFull := effectiveClass == classHeavy && heavy >= maxHeavy
+		if !globalFull && !heavyFull {
+			if isDuplicate {
+				existing.refCount++
+				r.mu.Unlock()
+				return acquireOutcome{OK: true, Duplicate: true}
+			}
+			r.entries[cmdID] = &inflightEntry{cmdType: cmdType, class: effectiveClass, start: r.now(), refCount: 1}
+			r.mu.Unlock()
+			return acquireOutcome{OK: true}
+		}
+
+		wake := r.waitCh
+		r.mu.Unlock()
+
+		select {
+		case <-wake:
+			continue // capacity may have freed; loop back and recheck under the lock
+		case <-ctx.Done():
+			// blockedBy reflects the constraint that was binding on THIS
+			// (the last) check, captured above before releasing the lock —
+			// not recomputed from fresh counts after ctx.Done() fires, which
+			// could report "global" for a command that was actually blocked
+			// on the heavy sub-limit the whole time if global count happened
+			// to dip in the interim.
+			blocked := "global"
+			if heavyFull {
+				blocked = "heavy"
+			}
+			return acquireOutcome{OK: false, BlockedBy: blocked, Global: global, Heavy: heavy}
+		}
+	}
 }
 
 // remove decrements the ref count for cmdID and deletes the entry once it
 // reaches zero. It is a deliberate no-op if cmdID is not tracked (already
 // removed, or never added) so that defer-based cleanup can never panic or
 // under/over-count regardless of which code path reached it.
+//
+// Every successful decrement (i.e. cmdID was tracked) wakes every goroutine
+// currently blocked in acquire()'s select, because a decrement — whether or
+// not it deletes the entry outright — always reduces the total reserved
+// capacity by one unit, and that unit might be exactly what an acquire()
+// waiter needs.
 func (r *inflightRegistry) remove(cmdID string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	e, exists := r.entries[cmdID]
 	if !exists {
+		r.mu.Unlock()
 		return
 	}
 	e.refCount--
 	if e.refCount <= 0 {
 		delete(r.entries, cmdID)
 	}
+	oldWake := r.waitCh
+	r.waitCh = make(chan struct{})
+	r.mu.Unlock()
+	close(oldWake)
 }
 
 // count returns the total number of in-flight dispatches (counting

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -367,6 +368,171 @@ func TestRegistry_DuplicateCmdID(t *testing.T) {
 	}
 }
 
+// 1. Per-class counting is correct: countsLocked derives (global, heavy)
+// purely from registry contents, and stays correct under concurrent
+// acquire()/remove() across both classes — this is the "single source of
+// truth, no separate drifting counter" property extended to per-class
+// counts.
+func TestRegistry_PerClassCounting(t *testing.T) {
+	r, _ := newTestRegistry()
+	ctx := context.Background()
+
+	if out := r.acquire(ctx, "h1", "shell", 10, 5); !out.OK {
+		t.Fatalf("acquire(h1) = %+v, want OK", out)
+	}
+	if out := r.acquire(ctx, "h2", "file_transfer", 10, 5); !out.OK {
+		t.Fatalf("acquire(h2) = %+v, want OK", out)
+	}
+	if out := r.acquire(ctx, "l1", "file_op", 10, 5); !out.OK {
+		t.Fatalf("acquire(l1) = %+v, want OK", out)
+	}
+
+	r.mu.Lock()
+	global, heavy := r.countsLocked()
+	r.mu.Unlock()
+	if global != 3 {
+		t.Fatalf("global count = %d, want 3", global)
+	}
+	if heavy != 2 {
+		t.Fatalf("heavy count = %d, want 2", heavy)
+	}
+
+	r.remove("h1")
+	r.mu.Lock()
+	global, heavy = r.countsLocked()
+	r.mu.Unlock()
+	if global != 2 || heavy != 1 {
+		t.Fatalf("after removing one heavy entry: global=%d heavy=%d, want global=2 heavy=1", global, heavy)
+	}
+
+	r.remove("h2")
+	r.remove("l1")
+	r.mu.Lock()
+	global, heavy = r.countsLocked()
+	r.mu.Unlock()
+	if global != 0 || heavy != 0 {
+		t.Fatalf("after removing everything: global=%d heavy=%d, want 0/0", global, heavy)
+	}
+}
+
+// Per-class counting under genuine concurrent mutation: many goroutines
+// acquire/remove a mix of heavy and light commands simultaneously; the
+// derived (global, heavy) counts must never be observed inconsistent with
+// registry contents, and must land at exactly 0/0 once every goroutine has
+// finished.
+func TestRegistry_PerClassCounting_ConcurrentMutation(t *testing.T) {
+	r, _ := newTestRegistry()
+	ctx := context.Background()
+
+	const workers = 40
+	const opsPerWorker = 50
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < opsPerWorker; i++ {
+				id := fmt.Sprintf("w%d-op%d", worker, i)
+				cmdType := "file_op"
+				if i%2 == 0 {
+					cmdType = "shell"
+				}
+				// Generous limits: this test is about counting correctness
+				// under concurrency, not admission-control blocking.
+				out := r.acquire(ctx, id, cmdType, workers*opsPerWorker, workers*opsPerWorker)
+				if !out.OK {
+					t.Errorf("acquire(%s) unexpectedly blocked/rejected: %+v", id, out)
+					return
+				}
+				// Read counts mid-flight from another goroutine's perspective
+				// to exercise the lock under contention; no assertion on the
+				// exact value here (it's a moving target), just that it
+				// doesn't panic or corrupt state.
+				r.mu.Lock()
+				_, _ = r.countsLocked()
+				r.mu.Unlock()
+				r.remove(id)
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	r.mu.Lock()
+	global, heavy := r.countsLocked()
+	r.mu.Unlock()
+	if global != 0 || heavy != 0 {
+		t.Fatalf("after all concurrent acquire/remove pairs completed: global=%d heavy=%d, want 0/0", global, heavy)
+	}
+	if len(r.entries) != 0 {
+		t.Fatalf("registry map not empty after concurrent per-class mutation: %d entries", len(r.entries))
+	}
+}
+
+// acquire()'s own duplicate-cmd_id path (distinct from add()'s, which is
+// tested separately): a second acquire() for a cmd_id already reserved by
+// a still-in-flight dispatch is subjected to EXACTLY the same capacity
+// check as any other command — the duplicate is a real additional unit of
+// tracked capacity (refCount++), not a free ride on the original's slot —
+// but if capacity IS available, joins the existing entry (refCount++)
+// rather than creating a second map entry.
+func TestRegistry_Acquire_DuplicateCmdID_SubjectToCapacityCheck(t *testing.T) {
+	r, _ := newTestRegistry()
+	ctx := context.Background()
+
+	// maxGlobal=2 gives room for the original PLUS one duplicate.
+	if out := r.acquire(ctx, "dup", "shell", 2, 2); !out.OK {
+		t.Fatalf("first acquire = %+v, want OK", out)
+	}
+
+	out := r.acquire(ctx, "dup", "shell", 2, 2)
+	if !out.OK || !out.Duplicate {
+		t.Fatalf("second acquire(dup) with capacity available = %+v, want OK=true Duplicate=true", out)
+	}
+	if got := r.count(); got != 2 {
+		t.Fatalf("count after duplicate acquire = %d, want 2 (duplicate consumes a real capacity unit)", got)
+	}
+	if len(r.entries) != 1 {
+		t.Fatalf("registry should have exactly 1 map entry for a duplicate cmd_id, got %d", len(r.entries))
+	}
+
+	r.remove("dup")
+	r.remove("dup")
+	if got := r.count(); got != 0 {
+		t.Fatalf("count after both removes = %d, want 0", got)
+	}
+}
+
+// A duplicate must be REJECTED (not admitted for free) when the registry is
+// already fully saturated — including when the original entry's own
+// refCount is exactly what fills the limit. This is the anti-replay
+// guarantee: a buggy or replaying API resending the same cmd_id must not be
+// able to bypass MaxConcurrency by piggybacking on an already-admitted
+// command.
+func TestRegistry_Acquire_DuplicateCmdID_RejectedWhenSaturated(t *testing.T) {
+	r, _ := newTestRegistry()
+
+	// maxGlobal=1: the single original entry already fills the only slot.
+	if out := r.acquire(context.Background(), "dup", "shell", 1, 1); !out.OK {
+		t.Fatalf("first acquire = %+v, want OK", out)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	out := r.acquire(ctx, "dup", "shell", 1, 1)
+	if out.OK {
+		t.Fatalf("duplicate acquire while saturated = %+v, want rejected", out)
+	}
+	if got := r.count(); got != 1 {
+		t.Fatalf("count after rejected duplicate = %d, want 1 (unchanged)", got)
+	}
+
+	r.remove("dup")
+	if got := r.count(); got != 0 {
+		t.Fatalf("count after removing the original = %d, want 0", got)
+	}
+}
+
 func TestSummarizeOldest(t *testing.T) {
 	entries := []inflightSnapshot{
 		{CmdID: "a", CmdType: "shell", Age: 90 * time.Second},
@@ -410,3 +576,4 @@ func TestTruncateForLog(t *testing.T) {
 		t.Fatalf("truncateForLog(long) = %q, want a truncation marker suffix", got)
 	}
 }
+

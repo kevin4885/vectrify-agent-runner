@@ -4,12 +4,14 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -41,18 +43,20 @@ const (
 	// failures occurred.
 	healthyDuration = 30 * time.Second
 
-	// maxDispatchConcurrency is the maximum number of command goroutines that may
-	// run simultaneously.  Prevents unbounded goroutine growth if the API sends a
-	// burst of commands (e.g. due to a server-side bug or replay).
-	maxDispatchConcurrency = 32
-
 	// staleCommandThreshold is how long a command may stay in-flight before the
-	// staleness monitor warns about it.  Set comfortably above maxShellTimeout
-	// (10 minutes, runner/runner.go) so a healthy long-running shell command
-	// never trips this — it exists to catch commands wedged past their own
-	// timeout (e.g. the descendant-process pipe-inheritance hang this dispatch
-	// layer was previously vulnerable to), not to police normal durations.
-	staleCommandThreshold = 15 * time.Minute
+	// staleness monitor warns about it. inflightEntry.start is set at
+	// successful acquire() (i.e. execution start), not at receipt from the
+	// WebSocket — time spent waiting in acquire() for a free slot does NOT
+	// count toward this age. So the invariant this must preserve is simply:
+	// stay comfortably above maxShellTimeout (runner/runner.go, 600s = 10m),
+	// the longest any single command's own execution is allowed to run. 20
+	// minutes keeps a wide margin over that 10m execution ceiling, so a
+	// healthy long-running shell command never trips this — it exists to
+	// catch commands wedged past their own timeout (e.g. the
+	// descendant-process pipe-inheritance hang this dispatch layer was
+	// previously vulnerable to), not to police normal durations. If
+	// maxShellTimeout is ever raised, raise this too so the margin holds.
+	staleCommandThreshold = 20 * time.Minute
 
 	// staleCheckInterval is how often the staleness monitor scans the registry.
 	staleCheckInterval = 30 * time.Second
@@ -60,6 +64,17 @@ const (
 	// rejectionLogTopN is how many of the oldest in-flight commands to include
 	// in the concurrency-limit rejection log line.
 	rejectionLogTopN = 5
+
+	// maxPendingSlotWaiters bounds how many dispatch hand-off goroutines
+	// (see recv loop below) may be simultaneously blocked inside
+	// inflightRegistry.acquire() waiting for a free slot. Without this cap,
+	// a sustained burst of incoming commands beyond capacity would grow one
+	// goroutine per command for up to SlotAcquireTimeoutSeconds each, which
+	// is itself an unbounded-growth risk during a bad burst — exactly the
+	// class of problem this whole change is trying to eliminate. Once the
+	// cap is hit, new commands are rejected immediately (no wait at all)
+	// rather than queuing a waiter that has to be tracked.
+	maxPendingSlotWaiters = 64
 )
 
 // Client manages one persistent WebSocket connection to the Vectrify API.
@@ -68,6 +83,35 @@ type Client struct {
 	runner   *runner.Runner
 	log      *slog.Logger
 	inflight *inflightRegistry // single source of truth for active dispatch count + detail
+
+	// dispatchFunc is the function dispatchOne calls once a slot has been
+	// acquired. Defaults to c.runner.Dispatch (set in New()); tests override
+	// it to inject panics/delays without needing a live Runner, so the
+	// admission-control logic in dispatchOne can be exercised in isolation
+	// from the executor package.
+	dispatchFunc func(raw protocol.RawCommand, send func(interface{}), triggerReconnect func())
+
+	// acquireTimeout returns the bounded-wait duration for one dispatch's
+	// slot acquisition. Defaults (in New()) to
+	// time.Duration(cfg.SlotAcquireTimeoutSeconds) * time.Second, i.e. the
+	// configured whole-second value. Pulled out as a func field (rather than
+	// reading cfg directly in dispatchOne) purely so tests can inject a
+	// sub-second timeout — SlotAcquireTimeoutSeconds is deliberately
+	// whole-second-only in the YAML config (this is an operator-facing
+	// tuning knob, not something that needs sub-second precision), but a
+	// test asserting "the reject path actually waited out the timeout"
+	// would otherwise cost a full real second per case.
+	acquireTimeout func() time.Duration
+
+	// pendingWaiters counts hand-off goroutines currently blocked in
+	// inflightRegistry.acquire() (see recv loop in connect()), bounded by
+	// maxPendingSlotWaiters. Plain int guarded by pendingMu rather than an
+	// atomic: it is always read-then-conditionally-incremented as one
+	// step, which a bare atomic.Int64 cannot express without a CAS loop —
+	// a mutex is simpler and this is not a hot path (one lock/unlock per
+	// inbound command, not per byte).
+	pendingMu      sync.Mutex
+	pendingWaiters int
 }
 
 // New creates a Client and starts its background staleness monitor.
@@ -77,6 +121,10 @@ type Client struct {
 // hold) survive reconnects, so a stale-command warning must too.
 func New(cfg *config.Config, r *runner.Runner, log *slog.Logger) *Client {
 	c := &Client{cfg: cfg, runner: r, log: log, inflight: newInflightRegistry()}
+	c.dispatchFunc = r.Dispatch
+	c.acquireTimeout = func() time.Duration {
+		return time.Duration(c.cfg.SlotAcquireTimeoutSeconds) * time.Second
+	}
 	go c.monitorStale()
 	return c
 }
@@ -110,10 +158,18 @@ func (c *Client) monitorStale() {
 // Drain blocks until all in-flight dispatch goroutines have finished or
 // timeout elapses.  Called by the auto-updater before os.Exit so that
 // commands already dispatched can complete and send their results back.
+//
+// Must check pendingWaiterCount() in addition to inflight.count(): a
+// command that is still waiting in acquire() for a free slot (see
+// dispatchOne) has not yet been added to the registry, so count() alone
+// could report 0 while a waiter is about to win a slot and start a brand
+// new command — which os.Exit (called right after Drain returns) would
+// then kill mid-flight with no result ever sent back, the exact loss Drain
+// exists to prevent.
 func (c *Client) Drain(timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if c.inflight.count() == 0 {
+		if c.inflight.count() == 0 && c.pendingWaiterCount() == 0 {
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -121,6 +177,7 @@ func (c *Client) Drain(timeout time.Duration) {
 	oldest := c.inflight.snapshot()
 	c.log.Warn("drain timeout: exiting with in-flight commands",
 		"active", c.inflight.count(),
+		"pending_waiters", c.pendingWaiterCount(),
 		"oldest", summarizeOldest(oldest, rejectionLogTopN),
 	)
 }
@@ -303,59 +360,37 @@ func (c *Client) connect() error {
 			continue
 		}
 
-		// Dispatch each command in its own goroutine so the recv loop is never
-		// blocked by a long-running shell command.  A deferred recover ensures a
-		// panicking handler never crashes the process.  The concurrency limit
-		// check below caps how many of these goroutines may run at once; if full
-		// the command is rejected with an error so the API caller gets a clear
-		// response rather than a silent queue build-up.
+		// Dispatch each command via a bounded hand-off goroutine so the recv
+		// loop is NEVER blocked waiting for a free slot: blocking here would
+		// stall pings and all other inbound traffic (including other
+		// commands' results streaming back), which is worse than the
+		// rejection this replaces. See tryReserveWaiter for the bound on how
+		// many of these hand-off goroutines may exist at once, and
+		// inflightRegistry.acquire for the bounded wait itself.
 		cmdID := raw.CmdID()
 		cmdType := raw.Type()
-		if active := c.inflight.count(); active >= maxDispatchConcurrency {
-			oldest := c.inflight.snapshot()
+		class := classifyCommand(cmdType)
+
+		if !c.tryReserveWaiter() {
 			c.log.Warn("dispatch: concurrency limit reached, rejecting command",
 				"cmd_id", cmdID,
 				"type", cmdType,
-				"active", active,
-				"limit", maxDispatchConcurrency,
-				"oldest_inflight", summarizeOldest(oldest, rejectionLogTopN),
+				"class", class.String(),
+				"reason", "pending_wait_cap",
+				"pending_waiters", c.pendingWaiterCount(),
+				"pending_wait_cap", maxPendingSlotWaiters,
 			)
 			send(protocol.ErrorMsg{
 				CmdID:   cmdID,
 				Type:    "error",
-				Message: fmt.Sprintf("runner busy: concurrency limit of %d reached (active=%d)", maxDispatchConcurrency, active),
+				Message: fmt.Sprintf("runner busy: too many commands already waiting for a free slot (cap=%d)", maxPendingSlotWaiters),
 			})
 			continue
 		}
-		// add() also tolerates (and logs) a duplicate cmd_id rather than
-		// silently corrupting the registry; see inflightRegistry.add.
-		if dup := c.inflight.add(cmdID, cmdType); dup {
-			c.log.Warn("dispatch: duplicate cmd_id received while original still in-flight",
-				"cmd_id", cmdID, "type", cmdType,
-			)
-		}
-		go func(raw protocol.RawCommand) {
-			// Unconditional: pairs with the add() above regardless of
-			// duplicates, panics, or which handler branch runs, so no
-			// registry entry (and no active-count unit) can ever leak.
-			defer c.inflight.remove(cmdID)
-			defer func() {
-				if p := recover(); p != nil {
-					c.log.Error("dispatch panic recovered",
-						"panic", p,
-						"stack", string(debug.Stack()),
-					)
-				}
-			}()
-			c.runner.Dispatch(raw, send, func() {
-				// Force this connection closed so the outer ReadMessage loop
-				// errors out and RunForever immediately reconnects, picking up
-				// the (just-updated) runner key from cfg. Safe to call multiple
-				// times / concurrently — Close() on an already-closed conn is a
-				// no-op error we don't care about.
-				_ = conn.Close()
-			})
-		}(raw)
+
+		go func(raw protocol.RawCommand, cmdID, cmdType string) {
+			c.dispatchOne(raw, cmdID, cmdType, send, func() { _ = conn.Close() })
+		}(raw, cmdID, cmdType)
 	}
 
 	// Signal the writer to stop, then wait for it to exit.
@@ -363,6 +398,170 @@ func (c *Client) connect() error {
 	<-writerDone
 
 	return readErr
+}
+
+// dispatchOne runs the bounded-wait admission check for one command and, if
+// admitted, calls c.dispatchFunc (normally c.runner.Dispatch, see New()). It
+// is the entire body of the hand-off goroutine spawned from the recv loop in
+// connect(), pulled out into its own method so it can be unit-tested
+// directly — tests override dispatchFunc to inject panics/delays without
+// needing a live Runner or WebSocket connection. send is called for the
+// busy-rejection error and is otherwise passed straight through;
+// triggerReconnect is passed straight through too (see runner.Dispatch's
+// doc comment — currently only update_key uses it).
+//
+// releaseWaiter is called as soon as acquire() returns (success or
+// failure) — see the comment at that call site for why it must NOT be
+// deferred to the end of this method.
+func (c *Client) dispatchOne(raw protocol.RawCommand, cmdID, cmdType string, send func(interface{}), triggerReconnect func()) {
+	class := classifyCommand(cmdType)
+
+	// releaseWaiterOnce guards against ever double-releasing (releaseWaiter
+	// is called explicitly right after acquire() returns, AND unconditionally
+	// deferred below as a safety net for a panic occurring before that point
+	// — e.g. inside acquire() itself, or context.WithTimeout). Without the
+	// once-guard, the normal path would call releaseWaiter() twice (once
+	// explicitly, once via the deferred safety net), permanently leaking a
+	// pending-waiter slot in the OTHER direction. Without the deferred safety
+	// net at all, a panic before the explicit call would leak one waiter
+	// slot per panic — after maxPendingSlotWaiters (64) such panics, EVERY
+	// subsequent command would be rejected at the pending-wait cap forever,
+	// with no way to recover except a restart.
+	var waiterReleased bool
+	releaseWaiterOnce := func() {
+		if !waiterReleased {
+			waiterReleased = true
+			c.releaseWaiter()
+		}
+	}
+	defer releaseWaiterOnce()
+
+	// Recovers a panic from anywhere in this method, including a
+	// (theoretical) panic inside acquire() itself, not just from Dispatch.
+	defer func() {
+		if p := recover(); p != nil {
+			c.log.Error("dispatch panic recovered",
+				"panic", p,
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+
+	// Bounded wait: acquire() blocks at most acquireTimeout() for a free
+	// slot before giving up, instead of rejecting the instant the limit is
+	// hit. This absorbs the normal brief oversubscription from sub-agents
+	// fanning out parallel tool calls. Waiters are woken in broadcast (not
+	// strict FIFO) order — see inflightRegistry for why that trade-off is
+	// acceptable here.
+	ctx, cancel := context.WithTimeout(context.Background(), c.acquireTimeout())
+	defer cancel()
+
+	outcome := c.inflight.acquire(ctx, cmdID, cmdType, c.cfg.MaxConcurrency, c.cfg.MaxHeavyConcurrency)
+	// pendingWaiters must count only goroutines actually *waiting* to
+	// acquire a slot, mirroring maxPendingSlotWaiters' purpose of bounding
+	// hand-off-goroutine growth during a burst — it must NOT also count
+	// goroutines that already won a slot and are now running the
+	// (potentially long) dispatchFunc. Releasing here, the instant acquire()
+	// returns (success or failure), rather than deferring to the end of
+	// this method, keeps the pending-wait cap a purely burst-absorbing cap
+	// instead of it silently becoming a second, lower concurrency ceiling
+	// (min(maxPendingSlotWaiters, MaxConcurrency)).
+	releaseWaiterOnce()
+	if !outcome.OK {
+		oldest := c.inflight.snapshot()
+		c.log.Warn("dispatch: concurrency limit reached, rejecting command",
+			"cmd_id", cmdID,
+			"type", cmdType,
+			"class", class.String(),
+			"reason", outcome.BlockedBy,
+			"active", outcome.Global,
+			"heavy_active", outcome.Heavy,
+			"limit", c.cfg.MaxConcurrency,
+			"heavy_limit", c.cfg.MaxHeavyConcurrency,
+			"oldest_inflight", summarizeOldest(oldest, rejectionLogTopN),
+		)
+		send(protocol.ErrorMsg{
+			CmdID:   cmdID,
+			Type:    "error",
+			Message: busyMessage(outcome, c.cfg),
+		})
+		return
+	}
+	if outcome.Duplicate {
+		c.log.Warn("dispatch: duplicate cmd_id received while original still in-flight",
+			"cmd_id", cmdID, "type", cmdType,
+		)
+	}
+
+	// Unconditional: pairs with the successful acquire() above regardless of
+	// duplicates, panics, or which handler branch runs, so no registry entry
+	// (and no active-count unit) can ever leak. Deferred after acquire()
+	// succeeds — nothing to release if acquire() itself returned !OK above.
+	defer c.inflight.remove(cmdID)
+
+	c.dispatchFunc(raw, send, triggerReconnect)
+}
+
+// tryReserveWaiter reserves one of the maxPendingSlotWaiters hand-off-
+// goroutine slots, returning false without blocking if the cap is already
+// reached. This is a separate, tighter cap from the dispatch concurrency
+// limits themselves: it bounds how many goroutines may exist AT ALL waiting
+// on inflightRegistry.acquire(), so a sustained burst of inbound commands
+// beyond capacity cannot grow one goroutine per command for up to
+// SlotAcquireTimeoutSeconds each — that would just be a slower-motion
+// version of the unbounded-growth problem this whole change exists to
+// eliminate. Every true result MUST be paired with exactly one
+// releaseWaiter() call (via defer at the call site).
+func (c *Client) tryReserveWaiter() bool {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if c.pendingWaiters >= maxPendingSlotWaiters {
+		return false
+	}
+	c.pendingWaiters++
+	return true
+}
+
+// releaseWaiter releases one hand-off-goroutine slot reserved by a prior
+// successful tryReserveWaiter() call. Floors at 0 rather than going
+// negative on an unbalanced call — a defensive guard, not something normal
+// operation should ever hit (see dispatchOne's releaseWaiterOnce, which
+// exists specifically to make every call site call this at most once).
+func (c *Client) releaseWaiter() {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if c.pendingWaiters > 0 {
+		c.pendingWaiters--
+	}
+}
+
+// pendingWaiterCount returns the current number of hand-off goroutines
+// blocked waiting for a free dispatch slot. Used by Drain — see its doc
+// comment for why counting inflight.count() alone is not sufficient.
+func (c *Client) pendingWaiterCount() int {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	return c.pendingWaiters
+}
+
+// busyMessage builds the protocol.ErrorMsg text for a rejected dispatch.
+// Always keeps the literal substring "runner busy" (the API surfaces this
+// verbatim to the LLM) but states which specific limit was hit so the agent
+// can reason about what to do next (e.g. retry a light command immediately,
+// but back off longer before retrying another heavy one).
+func busyMessage(outcome acquireOutcome, cfg *config.Config) string {
+	switch outcome.BlockedBy {
+	case "heavy":
+		return fmt.Sprintf(
+			"runner busy: heavy-command concurrency limit of %d reached (active=%d); light commands are unaffected",
+			cfg.MaxHeavyConcurrency, outcome.Heavy,
+		)
+	default: // "global"
+		return fmt.Sprintf(
+			"runner busy: concurrency limit of %d reached (active=%d)",
+			cfg.MaxConcurrency, outcome.Global,
+		)
+	}
 }
 
 // backoff returns the wait duration for the given attempt number.
