@@ -7,16 +7,50 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // FileOps handles all file system operations for the runner.
 type FileOps struct {
 	workspaceRoot string
+
+	// pathLocks guards per-path mutual exclusion for file operations.
+	// Without this, two concurrent tool calls targeting the SAME file
+	// (e.g. the LLM issuing two str_replace calls on one path within a
+	// single turn — engine.py's _run_tools_concurrently dispatches every
+	// tool_use as an independent task with no per-path coordination) each
+	// read the file, compute their edit against that snapshot, and write
+	// back — the second write silently discards the first edit (classic
+	// read-modify-write / TOCTOU race). mu protects the map itself; each
+	// path gets its own *sync.Mutex so unrelated files never contend.
+	mu        sync.Mutex
+	pathLocks map[string]*sync.Mutex
 }
 
 // NewFileOps creates a FileOps scoped to the given workspace root.
 func NewFileOps(workspaceRoot string) *FileOps {
-	return &FileOps{workspaceRoot: filepath.Clean(workspaceRoot)}
+	return &FileOps{
+		workspaceRoot: filepath.Clean(workspaceRoot),
+		pathLocks:     make(map[string]*sync.Mutex),
+	}
+}
+
+// lockPath acquires exclusive access to the given cleaned absolute path and
+// returns a function that releases it. Callers must defer the returned
+// function. Held for the full duration of a read-modify-write (or a plain
+// write/delete) so no other goroutine can observe or clobber an in-flight
+// change to the same file.
+func (f *FileOps) lockPath(path string) func() {
+	f.mu.Lock()
+	pl, ok := f.pathLocks[path]
+	if !ok {
+		pl = &sync.Mutex{}
+		f.pathLocks[path] = pl
+	}
+	f.mu.Unlock()
+
+	pl.Lock()
+	return pl.Unlock
 }
 
 // guardPath validates that path is inside the workspace root.
@@ -43,6 +77,7 @@ func (f *FileOps) ReadFile(path string, viewRange []int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer f.lockPath(clean)()
 
 	info, err := os.Stat(clean)
 	if err != nil {
@@ -162,6 +197,8 @@ func (f *FileOps) WriteFile(path, content string) error {
 	if err != nil {
 		return err
 	}
+	defer f.lockPath(clean)()
+
 	if err := os.MkdirAll(filepath.Dir(clean), 0755); err != nil {
 		return fmt.Errorf("creating parent directories: %w", err)
 	}
@@ -175,6 +212,8 @@ func (f *FileOps) StrReplace(path, oldStr, newStr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer f.lockPath(clean)()
+
 	data, err := os.ReadFile(clean)
 	if err != nil {
 		return "", fmt.Errorf("file not found: %s", path)
@@ -204,6 +243,8 @@ func (f *FileOps) Insert(path string, lineNum int, newStr string) (string, error
 	if err != nil {
 		return "", err
 	}
+	defer f.lockPath(clean)()
+
 	data, err := os.ReadFile(clean)
 	if err != nil {
 		return "", fmt.Errorf("file not found: %s", path)
@@ -238,5 +279,7 @@ func (f *FileOps) DeleteFile(path string) error {
 	if err != nil {
 		return err
 	}
+	defer f.lockPath(clean)()
+
 	return os.Remove(clean)
 }

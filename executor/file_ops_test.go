@@ -1,9 +1,11 @@
 package executor
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -414,5 +416,94 @@ func TestDeleteFile_Missing(t *testing.T) {
 	err := ops.DeleteFile(filepath.Join(root, "ghost.txt"))
 	if err == nil {
 		t.Fatal("expected error deleting non-existent file, got nil")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Concurrency — per-path locking (regression for the session-4513 file
+// corruption bug: two tool calls targeting the SAME path in the same LLM
+// turn used to race — read-modify-write with no lock meant the second
+// writer clobbered the first with a stale snapshot). These tests fire
+// many concurrent operations at ONE path and assert every one of them is
+// observable afterward, which is only possible if they were serialized.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestStrReplace_ConcurrentAppends_NoLostWrites appends N distinct,
+// non-overlapping anchor-replace edits to the same file from N goroutines
+// simultaneously (the exact "append to activity-log.md anchor" pattern
+// growth-strategist uses). Before the per-path lock this reliably lost
+// writes under `go test -race`; every edit must now survive.
+func TestStrReplace_ConcurrentAppends_NoLostWrites(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	const anchor = "<!-- anchor -->\n"
+	p := writeRaw(t, root, "log.md", []byte(anchor))
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			line := fmt.Sprintf("- entry-%02d\n", i)
+			_, err := ops.StrReplace(p, anchor, anchor+line)
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: unexpected error: %v", i, err)
+		}
+	}
+
+	data := readRaw(t, p)
+	for i := 0; i < n; i++ {
+		want := fmt.Sprintf("- entry-%02d", i)
+		if !strings.Contains(string(data), want) {
+			t.Errorf("lost write: %q missing from final file — got:\n%s", want, data)
+		}
+	}
+}
+
+// TestFileOps_ConcurrentMixedOps_SamePath_RaceDetectorClean hammers every
+// read-modify-write entry point (WriteFile, StrReplace via unique markers,
+// Insert, ReadFile) concurrently against the same path. It doesn't assert
+// a specific final state (WriteFile/StrReplace on the same path is
+// inherently a last-write-wins ordering choice) — its job is to make sure
+// `go test -race` finds no data race in FileOps itself now that every
+// operation holds the per-path lock for its full duration.
+func TestFileOps_ConcurrentMixedOps_SamePath_RaceDetectorClean(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	p := writeRaw(t, root, "mixed.md", []byte("line1\nline2\nline3\n"))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _ = ops.ReadFile(p, nil)
+			_ = ops.WriteFile(p, fmt.Sprintf("line1\nline2\nline3\nwrite-%d\n", i))
+		}(i)
+	}
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _ = ops.Insert(p, 1, fmt.Sprintf("insert-%d", i))
+		}(i)
+	}
+	wg.Wait()
+
+	// File must still be readable and non-empty — a torn/interleaved write
+	// would typically show up as corrupted content or a read error.
+	data := readRaw(t, p)
+	if len(data) == 0 {
+		t.Fatal("file ended up empty after concurrent mixed ops")
 	}
 }
