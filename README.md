@@ -113,6 +113,9 @@ Config is written by the installer. To change a setting, edit the file and resta
 | `log_level` | | `info` | Verbosity: `debug` \| `info` \| `warn` \| `error` |
 | `reconnect_max_backoff` | | `60` | Maximum seconds between reconnect attempts (exponential backoff) |
 | `log_file` | | *(auto on Windows service)* | Path to write logs. Set automatically on Windows; on Linux/macOS the service manager captures stdout. |
+| `max_concurrency` | | `32` | Maximum number of commands the runner will dispatch at once, across all command types |
+| `max_heavy_concurrency` | | `24` | Sub-limit for "heavy" commands (`runner_shell`, file transfers). Must be strictly less than `max_concurrency` — an invalid value (including equal) is clamped to `max_concurrency - 1` automatically (with a warning logged) rather than preventing startup. Keeps at least one slot always available to fast commands (file edits, git) even when every heavy slot is busy |
+| `slot_acquire_timeout_seconds` | | `3` | How long an incoming command waits for a free slot before the runner replies "runner busy", instead of rejecting instantly the moment the limit is hit |
 
 ### Command-line flags
 

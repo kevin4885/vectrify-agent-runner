@@ -72,6 +72,15 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: logLevel}))
 
+	// Config.Load() runs before the logger exists, so any self-correction it
+	// performed (e.g. clamping an out-of-range max_heavy_concurrency) is
+	// recorded in cfg.Warnings instead of being logged directly. Surface it
+	// now so a bad tuning value is visible in the log, not silently
+	// swallowed just because the runner chose to boot anyway.
+	for _, w := range cfg.Warnings {
+		log.Warn("config warning", "detail", w)
+	}
+
 	log.Info("vectrify agent runner starting",
 		"version",        config.Version,
 		"platform",       config.Platform(),
