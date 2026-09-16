@@ -81,7 +81,7 @@ All messages are JSON over the WebSocket.
 ### Runner → API (on connect)
 ```json
 { "type": "register", "platform": "linux", "workspace_root": "/home/user/projects",
-  "allow_shell": true, "version": "1.0.0" }
+  "allow_shell": true, "allow_browser": false, "version": "1.0.0" }
 ```
 
 ### API → Runner (ack)

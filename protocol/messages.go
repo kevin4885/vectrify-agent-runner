@@ -36,6 +36,7 @@ type RegisterMsg struct {
 	Platform      string `json:"platform"`       // "linux" | "darwin" | "windows"
 	WorkspaceRoot string `json:"workspace_root"` // absolute path configured by the user
 	AllowShell    bool   `json:"allow_shell"`    // mirrors config.AllowShell
+	AllowBrowser  bool   `json:"allow_browser"`  // mirrors config.AllowBrowser
 	Version       string `json:"version"`        // runner app semver, e.g. "1.0.0"
 }
 
