@@ -25,11 +25,14 @@ func (c commandClass) String() string {
 // classifyCommand maps a command's "type" string to its reservation class.
 //
 // heavy: commands that can legitimately run for a long time or block on
-// external I/O — "shell" (arbitrary user command, up to maxShellTimeout) and
-// "file_transfer" (S3 upload/download of up to 100 MiB). These are exactly
-// the command types that produced the original incident: enough of them
-// wedged simultaneously starved the fast, interactive commands of every
-// slot.
+// external I/O — "shell" (arbitrary user command, up to maxShellTimeout),
+// "file_transfer" (S3 upload/download of up to 100 MiB), and "browser"
+// (Playwright actions — page navigation and JS evaluation can legitimately
+// take many seconds, and a wedged/hung page would otherwise behave exactly
+// like the wedged-shell incident this mechanism was built to contain).
+// These are exactly the command types that produced the original incident:
+// enough of them wedged simultaneously starved the fast, interactive
+// commands of every slot.
 //
 // light: everything else — "file_op", "git", "update_key", and any unknown
 // or future command type. Unknown types default to light deliberately, NOT
@@ -44,7 +47,7 @@ func (c commandClass) String() string {
 // made.
 func classifyCommand(cmdType string) commandClass {
 	switch cmdType {
-	case "shell", "file_transfer":
+	case "shell", "file_transfer", "browser":
 		return classHeavy
 	default:
 		return classLight

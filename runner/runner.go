@@ -23,6 +23,7 @@ const maxShellTimeout = 10 * time.Minute
 type Runner struct {
 	fileOps       *executor.FileOps
 	shell         *executor.Shell
+	browser       *executor.BrowserManager
 	workspaceRoot string
 	cfg           *config.Config
 	log           *slog.Logger
@@ -31,12 +32,28 @@ type Runner struct {
 // New creates a Runner with executors scoped to workspaceRoot.
 func New(cfg *config.Config, log *slog.Logger) *Runner {
 	return &Runner{
-		fileOps:       executor.NewFileOps(cfg.WorkspaceRoot),
-		shell:         executor.NewShell(cfg.WorkspaceRoot, log),
+		fileOps: executor.NewFileOps(cfg.WorkspaceRoot),
+		shell:   executor.NewShell(cfg.WorkspaceRoot, log),
+		browser: executor.NewBrowserManager(
+			cfg.WorkspaceRoot,
+			cfg.MaxBrowserSessions,
+			time.Duration(cfg.BrowserIdleTimeoutSeconds)*time.Second,
+			cfg.IsBrowserHeadless(),
+			log,
+		),
 		workspaceRoot: cfg.WorkspaceRoot,
 		cfg:           cfg,
 		log:           log,
 	}
+}
+
+// Shutdown releases resources held by the Runner's executors — currently
+// just the browser manager's Chromium process + driver, if it was ever
+// started. Safe to call even if no browser command was ever dispatched
+// (BrowserManager.Shutdown no-ops in that case). Called from main.go on
+// graceful shutdown.
+func (r *Runner) Shutdown() {
+	r.browser.Shutdown()
 }
 
 // Dispatch processes one inbound command and calls send for each outbound message.
@@ -62,6 +79,8 @@ func (r *Runner) Dispatch(raw protocol.RawCommand, send func(interface{}), trigg
 		r.handleFileTransfer(cmdID, raw, send)
 	case "update_key":
 		r.handleUpdateKey(cmdID, raw, send, triggerReconnect)
+	case "browser":
+		r.handleBrowser(cmdID, raw, send)
 	default:
 		send(protocol.ErrorMsg{
 			CmdID:   cmdID,
@@ -201,6 +220,144 @@ func (r *Runner) handleFileTransfer(cmdID string, raw protocol.RawCommand, send 
 
 	// Encode result as a small JSON string (matches the ResultMsg.Data convention).
 	data := fmt.Sprintf(`{"bytes":%d,"sha256":%q}`, result.Bytes, result.SHA256)
+	send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: true, Data: data})
+}
+
+// ── Browser ────────────────────────────────────────────────────────────────
+
+// handleBrowser dispatches one "browser" command to the shared
+// BrowserManager. Gated by cfg.AllowBrowser, mirroring AllowShell's gating
+// pattern in intent (though enforced entirely runner-side here — unlike
+// shell, the API has no separate allow_browser flag to check before
+// sending, so the runner is the only enforcement point).
+//
+// Every action operates on a session_id supplied by the caller; the first
+// action referencing a new session_id implicitly creates it (see
+// BrowserManager.getOrCreateSession), except "close" which is a no-op for
+// an unknown session_id rather than an error.
+func (r *Runner) handleBrowser(cmdID string, raw protocol.RawCommand, send func(interface{})) {
+	if !r.cfg.AllowBrowser {
+		send(protocol.ResultMsg{
+			CmdID: cmdID, Type: "result", OK: false,
+			Error: "browser commands are disabled on this runner (allow_browser=false in config.yaml)",
+		})
+		return
+	}
+
+	action, _ := raw["action"].(string)
+	sessionID, _ := raw["session_id"].(string)
+	if sessionID == "" {
+		send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: false, Error: "session_id is required"})
+		return
+	}
+
+	var data string
+	var err error
+
+	switch action {
+	case "launch":
+		err = r.browser.Launch(sessionID)
+		if err == nil {
+			data = fmt.Sprintf("browser session %q launched", sessionID)
+		}
+
+	case "goto":
+		url, _ := raw["url"].(string)
+		if url == "" {
+			err = fmt.Errorf("url is required for goto")
+			break
+		}
+		timeout := protocol.Int(raw["timeout_seconds"])
+		err = r.browser.Goto(sessionID, url, timeout)
+		if err == nil {
+			data = fmt.Sprintf("navigated to %s", url)
+		}
+
+	case "click":
+		selector, _ := raw["selector"].(string)
+		if selector == "" {
+			err = fmt.Errorf("selector is required for click")
+			break
+		}
+		timeout := protocol.Int(raw["timeout_seconds"])
+		err = r.browser.Click(sessionID, selector, timeout)
+		if err == nil {
+			data = fmt.Sprintf("clicked %s", selector)
+		}
+
+	case "fill":
+		selector, _ := raw["selector"].(string)
+		value, _ := raw["value"].(string)
+		if selector == "" {
+			err = fmt.Errorf("selector is required for fill")
+			break
+		}
+		timeout := protocol.Int(raw["timeout_seconds"])
+		err = r.browser.Fill(sessionID, selector, value, timeout)
+		if err == nil {
+			data = fmt.Sprintf("filled %s", selector)
+		}
+
+	case "wait_for_selector":
+		selector, _ := raw["selector"].(string)
+		if selector == "" {
+			err = fmt.Errorf("selector is required for wait_for_selector")
+			break
+		}
+		state, _ := raw["state"].(string)
+		timeout := protocol.Int(raw["timeout_seconds"])
+		err = r.browser.WaitForSelector(sessionID, selector, state, timeout)
+		if err == nil {
+			data = fmt.Sprintf("selector %s reached state", selector)
+		}
+
+	case "screenshot":
+		path, _ := raw["path"].(string)
+		fullPage := protocol.Bool(raw["full_page"])
+		err = r.browser.Screenshot(sessionID, path, fullPage)
+		if err == nil {
+			data = fmt.Sprintf("screenshot saved: %s", path)
+		}
+
+	case "get_text":
+		selector, _ := raw["selector"].(string)
+		data, err = r.browser.GetText(sessionID, selector)
+
+	case "content":
+		data, err = r.browser.GetContent(sessionID)
+
+	case "evaluate":
+		expression, _ := raw["expression"].(string)
+		if expression == "" {
+			err = fmt.Errorf("expression is required for evaluate")
+			break
+		}
+		var result interface{}
+		result, err = r.browser.Evaluate(sessionID, expression)
+		if err == nil {
+			if b, marshalErr := json.Marshal(result); marshalErr == nil {
+				data = string(b)
+			} else {
+				data = fmt.Sprintf("%v", result)
+			}
+		}
+
+	case "close":
+		r.browser.Close(sessionID)
+		data = fmt.Sprintf("browser session %q closed", sessionID)
+
+	default:
+		send(protocol.ResultMsg{
+			CmdID: cmdID, Type: "result", OK: false,
+			Error: fmt.Sprintf("unknown browser action: %q", action),
+		})
+		return
+	}
+
+	if err != nil {
+		send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: false, Error: err.Error()})
+		return
+	}
 	send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: true, Data: data})
 }
 

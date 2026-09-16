@@ -1,6 +1,6 @@
 # Vectrify Agent Runner
 
-A lightweight daemon that connects your machine to Vectrify Cloud, allowing AI agents to read and write files, run shell commands, and perform git operations on your real local projects — without any cloud sandbox or remote VM.
+A lightweight daemon that connects your machine to Vectrify Cloud, allowing AI agents to read and write files, run shell commands, perform git operations, and drive a real browser (Playwright, opt-in) on your real local projects — without any cloud sandbox or remote VM.
 
 ---
 
@@ -114,14 +114,44 @@ Config is written by the installer. To change a setting, edit the file and resta
 | `reconnect_max_backoff` | | `60` | Maximum seconds between reconnect attempts (exponential backoff) |
 | `log_file` | | *(auto on Windows service)* | Path to write logs. Set automatically on Windows; on Linux/macOS the service manager captures stdout. |
 | `max_concurrency` | | `32` | Maximum number of commands the runner will dispatch at once, across all command types |
-| `max_heavy_concurrency` | | `24` | Sub-limit for "heavy" commands (`runner_shell`, file transfers). Must be strictly less than `max_concurrency` — an invalid value (including equal) is clamped to `max_concurrency - 1` automatically (with a warning logged) rather than preventing startup. Keeps at least one slot always available to fast commands (file edits, git) even when every heavy slot is busy |
+| `max_heavy_concurrency` | | `24` | Sub-limit for "heavy" commands (`runner_shell`, file transfers, browser). Must be strictly less than `max_concurrency` — an invalid value (including equal) is clamped to `max_concurrency - 1` automatically (with a warning logged) rather than preventing startup. Keeps at least one slot always available to fast commands (file edits, git) even when every heavy slot is busy |
 | `slot_acquire_timeout_seconds` | | `3` | How long an incoming command waits for a free slot before the runner replies "runner busy", instead of rejecting instantly the moment the limit is hit |
+| `allow_browser` | | `false` | Set `true` to enable Playwright browser automation commands. Requires running `vectrify-runner -install-browsers` once on this machine first (see Browser automation below) |
+| `max_browser_sessions` | | `3` | Maximum concurrent browser sessions (each holds one Chromium context + page open) |
+| `browser_idle_timeout_seconds` | | `300` | Auto-close a browser session after this many seconds of inactivity |
+| `browser_headless` | | `true` | Set `false` to run browsers headed (visible window) — only useful for local debugging on a machine with a display |
 
 ### Command-line flags
 
 | Flag | Default | Description |
 |---|---|---|
 | `--config` | platform default | Path to the YAML config file |
+| `-install-browsers` | — | Downloads the Playwright driver + Chromium binaries (~300 MB) needed for browser commands, then exits. Run once per machine before setting `allow_browser: true` |
+
+---
+
+## Browser automation
+
+Browser commands let an agent drive a real Chromium browser on this machine —
+navigate, click, fill forms, take screenshots, extract text/HTML, run JS — via
+Playwright. Disabled by default (`allow_browser: false`).
+
+**Setup (once per machine):**
+```powershell
+# Windows
+.\vectrify-runner.exe -install-browsers
+```
+```bash
+# Linux / macOS
+./vectrify-runner -install-browsers
+```
+Then set `allow_browser: true` in config.yaml and restart the service.
+
+Every browser session applies basic stealth measures (realistic user agent,
+disabled automation flags, injected evasion script) to reduce detection by
+common bot-blocking systems. This helps against basic/medium bot detection but
+is not a guarantee against advanced systems like Cloudflare Turnstile or
+Akamai/PerimeterX/DataDome — see CLAUDE.md for details.
 
 ---
 
@@ -244,6 +274,7 @@ The log file is created on first run. If it never appears, the service failed to
 |---|---|
 | **Path containment** | Every file path is resolved to absolute, then checked against `workspace_root` before any I/O. Rejects `../` traversal. |
 | **Shell gating** | Shell execution is blocked unless `allow_shell: true` in config. The API also enforces this independently. |
+| **Browser gating** | Browser automation is blocked unless `allow_browser: true` in config. Screenshot destinations are subject to the same path containment rule as file operations. |
 | **Outbound only** | The runner makes one outbound WebSocket connection. No ports are listened on. |
 | **Run as regular user** | The service runs as `LocalSystem` on Windows and as the installing user on Linux/macOS — never as a privileged superuser beyond what the installer requires. |
 | **Key never logged** | The `runner_key` is used only in the WebSocket URL query string and is never written to log output. |

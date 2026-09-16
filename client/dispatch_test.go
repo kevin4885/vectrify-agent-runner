@@ -521,6 +521,7 @@ func TestClassifyCommand(t *testing.T) {
 	}{
 		{"shell", classHeavy},
 		{"file_transfer", classHeavy},
+		{"browser", classHeavy},
 		{"file_op", classLight},
 		{"git", classLight},
 		{"update_key", classLight},

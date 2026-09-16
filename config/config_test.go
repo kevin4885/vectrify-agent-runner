@@ -260,3 +260,131 @@ workspace_root: .
 		t.Fatal("Load() with missing api_url = nil error, want error")
 	}
 }
+
+// ── Browser config (allow_browser gating + tunables) ─────────────────────
+
+// AllowBrowser defaults to false — mirrors AllowShell's secure-by-default
+// gating pattern; browser commands must be explicitly opted into.
+func TestLoad_AllowBrowser_DefaultsFalse(t *testing.T) {
+	path := writeTestConfig(t, minimalValidConfig)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AllowBrowser {
+		t.Errorf("AllowBrowser = true, want false by default")
+	}
+}
+
+func TestLoad_BrowserDefaults_AppliedWhenAbsent(t *testing.T) {
+	path := writeTestConfig(t, minimalValidConfig)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.MaxBrowserSessions != defaultMaxBrowserSessions {
+		t.Errorf("MaxBrowserSessions = %d, want default %d", cfg.MaxBrowserSessions, defaultMaxBrowserSessions)
+	}
+	if cfg.BrowserIdleTimeoutSeconds != defaultBrowserIdleTimeoutSeconds {
+		t.Errorf("BrowserIdleTimeoutSeconds = %d, want default %d", cfg.BrowserIdleTimeoutSeconds, defaultBrowserIdleTimeoutSeconds)
+	}
+	if !cfg.IsBrowserHeadless() {
+		t.Errorf("IsBrowserHeadless() = false, want true by default")
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("Warnings = %v, want none for a config with no explicit browser tunables", cfg.Warnings)
+	}
+}
+
+func TestLoad_BrowserExplicitValues_Honored(t *testing.T) {
+	path := writeTestConfig(t, minimalValidConfig+`
+allow_browser: true
+max_browser_sessions: 2
+browser_idle_timeout_seconds: 60
+browser_headless: false
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.AllowBrowser {
+		t.Errorf("AllowBrowser = false, want true")
+	}
+	if cfg.MaxBrowserSessions != 2 {
+		t.Errorf("MaxBrowserSessions = %d, want 2", cfg.MaxBrowserSessions)
+	}
+	if cfg.BrowserIdleTimeoutSeconds != 60 {
+		t.Errorf("BrowserIdleTimeoutSeconds = %d, want 60", cfg.BrowserIdleTimeoutSeconds)
+	}
+	if cfg.IsBrowserHeadless() {
+		t.Errorf("IsBrowserHeadless() = true, want false (explicitly set)")
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("Warnings = %v, want none", cfg.Warnings)
+	}
+}
+
+// max_browser_sessions above the sanity ceiling must be clamped down (with
+// a warning), not honored verbatim — same rationale as max_concurrency's
+// ceiling: a typo'd value should not let the runner spawn an unbounded
+// number of real Chromium contexts.
+func TestLoad_MaxBrowserSessions_AboveSaneCeiling_Clamps(t *testing.T) {
+	path := writeTestConfig(t, minimalValidConfig+`
+max_browser_sessions: 500
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.MaxBrowserSessions != maxSaneBrowserSessions {
+		t.Fatalf("MaxBrowserSessions = %d, want clamped to %d", cfg.MaxBrowserSessions, maxSaneBrowserSessions)
+	}
+	if len(cfg.Warnings) == 0 {
+		t.Fatal("Warnings is empty, want a warning about the max_browser_sessions clamp")
+	}
+}
+
+// browser_idle_timeout_seconds above the sanity ceiling must be clamped
+// down (with a warning) rather than letting a forgotten session hold a real
+// Chromium process open indefinitely.
+func TestLoad_BrowserIdleTimeoutSeconds_AboveSaneCeiling_Clamps(t *testing.T) {
+	path := writeTestConfig(t, minimalValidConfig+`
+browser_idle_timeout_seconds: 999999
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.BrowserIdleTimeoutSeconds != maxSaneBrowserIdleTimeoutSeconds {
+		t.Fatalf("BrowserIdleTimeoutSeconds = %d, want clamped to %d", cfg.BrowserIdleTimeoutSeconds, maxSaneBrowserIdleTimeoutSeconds)
+	}
+	if len(cfg.Warnings) == 0 {
+		t.Fatal("Warnings is empty, want a warning about the browser_idle_timeout_seconds clamp")
+	}
+}
+
+// Zero and negative browser tunables must fall back to defaults, same
+// self-correction pattern as the concurrency tunables above.
+func TestLoad_ZeroOrNegativeBrowserTunables_FallBackToDefaults(t *testing.T) {
+	cases := []string{
+		"max_browser_sessions: 0",
+		"max_browser_sessions: -1",
+		"browser_idle_timeout_seconds: 0",
+		"browser_idle_timeout_seconds: -5",
+	}
+	for _, extra := range cases {
+		t.Run(extra, func(t *testing.T) {
+			path := writeTestConfig(t, minimalValidConfig+"\n"+extra+"\n")
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.MaxBrowserSessions <= 0 {
+				t.Errorf("MaxBrowserSessions = %d, want positive default", cfg.MaxBrowserSessions)
+			}
+			if cfg.BrowserIdleTimeoutSeconds <= 0 {
+				t.Errorf("BrowserIdleTimeoutSeconds = %d, want positive default", cfg.BrowserIdleTimeoutSeconds)
+			}
+		})
+	}
+}

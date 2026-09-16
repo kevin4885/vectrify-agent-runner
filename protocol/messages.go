@@ -19,6 +19,13 @@
 //	                Lets a key rotation apply live with zero downtime when the
 //	                runner is currently connected; no restart or file access
 //	                required from the user.
+//	browser       — Playwright-driven browser automation (navigate, click,
+//	                fill, screenshot, extract text/HTML, evaluate JS),
+//	                requires allow_browser=true. Actions operate on a
+//	                caller-supplied session_id; a session persists across
+//	                multiple commands until explicitly closed or reaped for
+//	                inactivity. See runner/runner.go handleBrowser and
+//	                executor/browser.go for the full action list.
 package protocol
 
 // ── Outbound (Runner → API) ────────────────────────────────────────────────────

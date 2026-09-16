@@ -10,6 +10,7 @@ import (
 
 	"vectrify/agent-runner/client"
 	"vectrify/agent-runner/config"
+	"vectrify/agent-runner/runner"
 	"vectrify/agent-runner/updater"
 )
 
@@ -18,6 +19,7 @@ import (
 type winSvc struct {
 	log    *slog.Logger
 	client *client.Client
+	runner *runner.Runner
 }
 
 // Execute is the entry point called by the Windows SCM when the service starts.
@@ -39,6 +41,7 @@ func (s *winSvc) Execute(_ []string, r <-chan svc.ChangeRequest, status chan<- s
 		case svc.Stop, svc.Shutdown:
 			s.log.Info("windows service: stop requested")
 			status <- svc.Status{State: svc.StopPending}
+			s.runner.Shutdown()
 			os.Exit(0)
 		}
 	}
@@ -47,14 +50,14 @@ func (s *winSvc) Execute(_ []string, r <-chan svc.ChangeRequest, status chan<- s
 
 // runService detects whether the process was launched by the Windows SCM and
 // runs in service mode if so, otherwise falls back to interactive (terminal) mode.
-func runService(log *slog.Logger, c *client.Client) {
+func runService(log *slog.Logger, c *client.Client, r *runner.Runner) {
 	isService, err := svc.IsWindowsService()
 	if err != nil || !isService {
-		runInteractive(log, c)
+		runInteractive(log, c, r)
 		return
 	}
 	log.Info("starting as windows service")
-	if err := svc.Run("VectrifyRunner", &winSvc{log: log, client: c}); err != nil {
+	if err := svc.Run("VectrifyRunner", &winSvc{log: log, client: c, runner: r}); err != nil {
 		log.Error("service run failed", "err", err)
 		os.Exit(1)
 	}

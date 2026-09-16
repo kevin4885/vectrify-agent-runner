@@ -19,7 +19,8 @@ Vectrify Cloud (AWS)                    Customer Machine
      └─ runner tools                          ├─ file_op   (read/write/list/delete)
         runner_file_editor                    ├─ shell     (bash or PowerShell)
         runner_shell                          ├─ git       (structured git ops)
-        runner_git                            └─ file_transfer (S3 ↔ runner filesystem)
+        runner_git                            ├─ file_transfer (S3 ↔ runner filesystem)
+                                               └─ browser   (Playwright automation, opt-in)
 ```
 
 ---
@@ -49,7 +50,8 @@ vectrify-agent-runner/
 ├── executor/
 │   ├── file_ops.go        File CRUD — read (with line numbers), write, str_replace, insert, delete
 │   ├── file_transfer.go   File transfer via presigned S3 URLs (download runner←S3, upload runner→S3)
-│   └── shell.go           Shell execution (bash/PowerShell) + structured git operations
+│   ├── shell.go           Shell execution (bash/PowerShell) + structured git operations
+│   └── browser.go         Playwright-driven browser automation (opt-in, see "Browser automation" below)
 └── runner/
     └── runner.go          Command dispatch loop — routes cmd_type to executor, formats responses
 ```
@@ -67,6 +69,8 @@ vectrify-agent-runner/
 | Windows Service | golang.org/x/sys/windows/svc |
 | Shell (Linux/macOS) | bash -c "..." |
 | Shell (Windows) | powershell -NoProfile -NonInteractive -Command "..." |
+| Browser automation | github.com/mxschmitt/playwright-go (opt-in, see below) |
+| Stealth evasions | github.com/jonfriesen/playwright-go-stealth (embedded JS only, see below) |
 
 ---
 
@@ -98,6 +102,16 @@ All messages are JSON over the WebSocket.
 { "cmd_id": "uuid", "type": "file_transfer", "direction": "upload",   "url": "<presigned-PUT>",
   "path": "/absolute/path/on/runner", "max_bytes": 104857600 }
 { "cmd_id": "uuid", "type": "update_key", "new_key": "vrun_..." }
+{ "cmd_id": "uuid", "type": "browser", "action": "launch",  "session_id": "s1" }
+{ "cmd_id": "uuid", "type": "browser", "action": "goto",    "session_id": "s1", "url": "https://example.com", "timeout_seconds": 30 }
+{ "cmd_id": "uuid", "type": "browser", "action": "click",   "session_id": "s1", "selector": "#submit" }
+{ "cmd_id": "uuid", "type": "browser", "action": "fill",    "session_id": "s1", "selector": "#search", "value": "hello" }
+{ "cmd_id": "uuid", "type": "browser", "action": "wait_for_selector", "session_id": "s1", "selector": "#result", "state": "visible" }
+{ "cmd_id": "uuid", "type": "browser", "action": "screenshot", "session_id": "s1", "path": "/absolute/path/shot.png", "full_page": true }
+{ "cmd_id": "uuid", "type": "browser", "action": "get_text", "session_id": "s1", "selector": "#result" }
+{ "cmd_id": "uuid", "type": "browser", "action": "content",  "session_id": "s1" }
+{ "cmd_id": "uuid", "type": "browser", "action": "evaluate", "session_id": "s1", "expression": "document.title" }
+{ "cmd_id": "uuid", "type": "browser", "action": "close",    "session_id": "s1" }
 ```
 
 **update_key notes:**
@@ -119,6 +133,25 @@ All messages are JSON over the WebSocket.
 - `path`: absolute path on the runner machine; must be inside `workspace_root`.
 - `max_bytes`: maximum file size in bytes (default/max 104857600 = 100 MiB).
 - `overwrite`: download only — if the destination already exists and `overwrite=false` the command fails with a descriptive error.
+
+**browser notes:**
+- Gated by `allow_browser` in config.yaml (default `false`) — mirrors `allow_shell`'s
+  secure-by-default pattern. Unlike shell, there is no separate API-side check; the
+  runner is the sole enforcement point.
+- `session_id` is caller-supplied and identifies a stateful browser session (one
+  Chromium `BrowserContext` + `Page`) that persists across multiple `browser` commands
+  until explicitly closed (`action: "close"`) or reaped after `browser_idle_timeout_seconds`
+  of inactivity. The first action referencing a new `session_id` implicitly creates it.
+- Actions: `launch`, `goto`, `click`, `fill`, `wait_for_selector` (`state`: attached |
+  detached | hidden | visible), `screenshot` (`path` validated against `workspace_root`,
+  same containment rule as `file_op`), `get_text` (page body text, or a single selector's
+  text when `selector` is set), `content` (full page HTML), `evaluate` (arbitrary JS,
+  result JSON-encoded into `data`), `close` (idempotent — closing an unknown/already-closed
+  `session_id` is not an error).
+- Requires the Playwright driver + Chromium binaries to be installed once per machine —
+  see "Browser automation" below.
+- Classified `heavy` in `client/classify.go` (shares the heavy concurrency sub-limit with
+  `shell` and `file_transfer`).
 
 ### Runner → API (responses)
 ```json
@@ -151,11 +184,81 @@ max_heavy_concurrency: 24               # sub-limit for "heavy" commands (shell,
                                          # heavy slot is occupied
 slot_acquire_timeout_seconds: 3         # how long a command waits for a free slot before being
                                          # rejected as "runner busy", instead of rejecting instantly
+allow_browser:         false            # set true to enable Playwright browser commands (opt-in;
+                                         # requires `vectrify-runner -install-browsers` first — see
+                                         # "Browser automation" below)
+max_browser_sessions:  3                # max concurrent browser sessions (each = one Chromium
+                                         # BrowserContext + Page kept alive across commands)
+browser_idle_timeout_seconds: 300       # auto-close a browser session after this many seconds of
+                                         # inactivity (no command referencing its session_id)
+browser_headless:      true             # false only for local debugging on a machine with a display
 ```
 
 All three concurrency knobs are optional; the defaults shown above match the
 hardcoded behavior from before they became configurable, so an existing
-config.yaml with none of these keys set behaves identically.
+config.yaml with none of these keys set behaves identically. The four
+`allow_browser`/`max_browser_sessions`/`browser_idle_timeout_seconds`/
+`browser_headless` keys are likewise all optional — an existing config.yaml
+with none of them set boots with browser commands disabled and every other
+behavior unchanged.
+
+---
+
+## Browser automation
+
+Gated behind `allow_browser` (default `false`), the `browser` command type lets the
+API drive a real Chromium browser on the runner machine — navigate, click, fill,
+screenshot, extract text/HTML, evaluate JS — via
+[`github.com/mxschmitt/playwright-go`](https://github.com/mxschmitt/playwright-go).
+See the "browser notes" in the Command protocol section above for the full action list.
+
+### One-time setup
+
+Before setting `allow_browser: true`, download the Playwright driver + Chromium browser
+binaries once per machine (~300 MB):
+
+```powershell
+# Windows
+.\vectrify-runner.exe -install-browsers
+```
+```bash
+# Linux / macOS
+./vectrify-runner -install-browsers
+```
+
+This exits after downloading — it does not start the runner. Re-run it after any
+future Chromium version bump if browser commands start failing with a driver-version
+error.
+
+### Stealth
+
+Every launched browser context:
+- disables the Blink automation-controlled flag (`--disable-blink-features=AutomationControlled`)
+- uses a realistic desktop Chrome UA string, viewport, locale, and timezone (instead of
+  Playwright's own defaults, which are themselves a bot-detection signal)
+- injects the evasion script from
+  [`github.com/jonfriesen/playwright-go-stealth`](https://github.com/jonfriesen/playwright-go-stealth)
+  (the extracted `puppeteer-extra-plugin-stealth` evasions) into every new page
+
+**This raises the bar against basic/medium bot detection — it is NOT a guarantee
+against advanced systems** (Cloudflare Turnstile with behavioral scoring, Akamai,
+PerimeterX/DataDome). Those fingerprint TLS/JA3, canvas/audio noise, and mouse/timing
+behavior in ways a generic stealth layer cannot fully spoof, and it is a permanent
+cat-and-mouse game with no guarantee either way.
+
+**Implementation note (module-path gotcha):** `executor/browser.go` imports
+`github.com/jonfriesen/playwright-go-stealth` only for its embedded `stealth.StealthJS`
+string constant, injected via our own `page.AddInitScript(...)` call — NOT via that
+package's own `stealth.Inject(page)` helper. That helper's signature is pinned to the
+older `github.com/playwright-community/playwright-go` module path, which Go treats as a
+completely different type identity than `github.com/mxschmitt/playwright-go` (same
+upstream project, renamed on GitHub over time — the code lineage is identical but the
+two module paths are NOT interchangeable to the Go compiler). The newer module path is
+required here because the driver version pinned by the old path's latest tagged release
+(`v0.4201.1`) points at Playwright driver binaries Microsoft no longer hosts —
+`playwright.Install()` against it 404s. If `playwright-go-stealth` ever ships a release
+pinned to the newer module path, switching to its `Inject()` helper directly would be a
+safe simplification.
 
 ---
 
@@ -242,6 +345,7 @@ as assets on the GitHub Release. The one-liner install commands always pull from
    versions is unreadable by the non-root service user and the daemon fails
    immediately with "permission denied" on startup.
 5. **Key never logged** — `runner_key` is used only in the WebSocket URL; it is never written to log files.
+6. **Browser gating** — `browser` commands are blocked at the runner level if `allow_browser=false` (default). Screenshot destinations are subject to the same path-containment rule as `file_op` (invariant #1). No separate API-side check exists for this flag (unlike `allow_shell`) — the runner is the sole enforcement point.
 
 ---
 

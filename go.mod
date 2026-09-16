@@ -4,7 +4,19 @@ go 1.25.0
 
 require (
 	github.com/gorilla/websocket v1.5.3
+	github.com/jonfriesen/playwright-go-stealth v0.0.3
+	github.com/mxschmitt/playwright-go v0.6201.1
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require golang.org/x/sys v0.43.0
+
+require (
+	github.com/deckarep/golang-set/v2 v2.8.0 // indirect
+	github.com/go-jose/go-jose/v3 v3.0.3 // indirect
+	github.com/go-stack/stack v1.8.1 // indirect
+	github.com/kr/text v0.2.0 // indirect
+	github.com/playwright-community/playwright-go v0.4201.1 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
+	golang.org/x/exp v0.0.0-20240531132922-fd00a4e0eefc // indirect
+)

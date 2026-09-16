@@ -60,6 +60,32 @@ const (
 	// burst-absorption need while still self-correcting an obviously wrong
 	// value instead of refusing to boot.
 	maxSaneSlotAcquireTimeoutSeconds = 300
+
+	// defaultMaxBrowserSessions is the default size of the browser session
+	// pool (see BrowserManager in executor/browser.go). Each session holds
+	// one Chromium BrowserContext + Page alive in memory for as long as it
+	// is open, so this is intentionally small — a customer machine is not
+	// expected to run many concurrent agent-driven browsers at once, and a
+	// runaway number of sessions would multiply the ~300MB Chromium
+	// footprint per instance.
+	defaultMaxBrowserSessions = 3
+
+	// maxSaneBrowserSessions is a sanity ceiling on max_browser_sessions,
+	// clamped (with a warning) rather than honored verbatim, for the same
+	// reason as maxSaneConcurrency above: a typo'd config value should not
+	// silently let the runner spawn an unbounded number of real browser
+	// processes/contexts.
+	maxSaneBrowserSessions = 20
+
+	// defaultBrowserIdleTimeoutSeconds is how long an opened browser session
+	// may sit unused before the idle reaper closes it automatically. Exists
+	// so a forgotten `launch` (no matching `close`) does not hold a real
+	// Chromium process + memory open forever.
+	defaultBrowserIdleTimeoutSeconds = 300
+
+	// maxSaneBrowserIdleTimeoutSeconds bounds browser_idle_timeout_seconds;
+	// same self-correction rationale as the other maxSane* constants.
+	maxSaneBrowserIdleTimeoutSeconds = 3600
 )
 
 // Config holds all runner settings loaded from config.yaml.
@@ -117,6 +143,31 @@ type Config struct {
 	// normal, brief oversubscription that happens when sub-agents fan out
 	// several tool calls at once. Defaults to 3.
 	SlotAcquireTimeoutSeconds int `yaml:"slot_acquire_timeout_seconds"`
+
+	// AllowBrowser enables the "browser" command type (Playwright-driven
+	// browser automation — navigate, click, fill, screenshot, extract text,
+	// evaluate JS). When false (the default), browser commands are rejected
+	// with a clear error, mirroring AllowShell's gating pattern. Requires
+	// the browser driver + Chromium binaries to already be installed on
+	// this machine (see `vectrify-runner -install-browsers`); enabling this
+	// flag without running that step first will surface a clear error the
+	// first time a browser command is attempted, not at startup.
+	AllowBrowser bool `yaml:"allow_browser"`
+
+	// MaxBrowserSessions caps how many browser sessions (each one Chromium
+	// BrowserContext + Page kept alive across multiple "browser" commands)
+	// may be open at the same time. Defaults to 3.
+	MaxBrowserSessions int `yaml:"max_browser_sessions"`
+
+	// BrowserIdleTimeoutSeconds is how long an open browser session may sit
+	// unused (no browser command referencing its session_id) before it is
+	// automatically closed by the idle reaper. Defaults to 300 (5 minutes).
+	BrowserIdleTimeoutSeconds int `yaml:"browser_idle_timeout_seconds"`
+
+	// BrowserHeadless controls whether launched browsers run headless
+	// (no visible window) or headed. Defaults to true. Set false only for
+	// local debugging on a machine with a display.
+	BrowserHeadless *bool `yaml:"browser_headless"`
 
 	// ConfigPath is the absolute path this config was loaded from. Not part of
 	// the YAML file itself (yaml:"-") — set by Load() so the running process
@@ -303,6 +354,42 @@ func (c *Config) applyDefaults() {
 		))
 		c.MaxHeavyConcurrency = clamped
 	}
+
+	if c.MaxBrowserSessions <= 0 {
+		c.MaxBrowserSessions = defaultMaxBrowserSessions
+	} else if c.MaxBrowserSessions > maxSaneBrowserSessions {
+		c.Warnings = append(c.Warnings, fmt.Sprintf(
+			"max_browser_sessions (%d) exceeds the sanity ceiling of %d; clamping max_browser_sessions to %d",
+			c.MaxBrowserSessions, maxSaneBrowserSessions, maxSaneBrowserSessions,
+		))
+		c.MaxBrowserSessions = maxSaneBrowserSessions
+	}
+
+	if c.BrowserIdleTimeoutSeconds <= 0 {
+		c.BrowserIdleTimeoutSeconds = defaultBrowserIdleTimeoutSeconds
+	} else if c.BrowserIdleTimeoutSeconds > maxSaneBrowserIdleTimeoutSeconds {
+		c.Warnings = append(c.Warnings, fmt.Sprintf(
+			"browser_idle_timeout_seconds (%d) exceeds the sanity ceiling of %d; clamping browser_idle_timeout_seconds to %d",
+			c.BrowserIdleTimeoutSeconds, maxSaneBrowserIdleTimeoutSeconds, maxSaneBrowserIdleTimeoutSeconds,
+		))
+		c.BrowserIdleTimeoutSeconds = maxSaneBrowserIdleTimeoutSeconds
+	}
+	if c.BrowserHeadless == nil {
+		defaultHeadless := true
+		c.BrowserHeadless = &defaultHeadless
+	}
+}
+
+// IsBrowserHeadless returns the effective headless setting, defaulting to
+// true. Exposed as a method (rather than requiring every caller to dereference
+// the *bool) because applyDefaults() always populates BrowserHeadless before
+// Load() returns, but tests or callers constructing a Config by hand (not via
+// Load) might leave it nil.
+func (c *Config) IsBrowserHeadless() bool {
+	if c.BrowserHeadless == nil {
+		return true
+	}
+	return *c.BrowserHeadless
 }
 
 // deriveDefaultHeavyConcurrency computes the MaxHeavyConcurrency to use when

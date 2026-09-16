@@ -21,6 +21,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/mxschmitt/playwright-go"
+
 	"vectrify/agent-runner/client"
 	"vectrify/agent-runner/config"
 	"vectrify/agent-runner/runner"
@@ -28,8 +30,19 @@ import (
 )
 
 func main() {
+	installBrowsers := flag.Bool("install-browsers", false, "Download the Playwright driver + Chromium browser binaries needed for browser commands (allow_browser: true), then exit. Run this once per machine before enabling allow_browser.")
 	configPath := flag.String("config", "", "Path to config.yaml (default: ~/.vectrify-runner/config.yaml)")
 	flag.Parse()
+
+	if *installBrowsers {
+		fmt.Println("Downloading Playwright driver + Chromium browser binaries (this may take a minute)...")
+		if err := playwright.Install(&playwright.RunOptions{Browsers: []string{"chromium"}}); err != nil {
+			fmt.Fprintf(os.Stderr, "Error installing browsers: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Done. You can now set allow_browser: true in config.yaml.")
+		os.Exit(0)
+	}
 
 	if *configPath == "" {
 		*configPath = config.DefaultConfigPath()
@@ -86,22 +99,24 @@ func main() {
 		"platform",       config.Platform(),
 		"workspace_root", cfg.WorkspaceRoot,
 		"allow_shell",    cfg.AllowShell,
+		"allow_browser",  cfg.AllowBrowser,
 	)
 
 	r := runner.New(cfg, log)
 	c := client.New(cfg, r, log)
-	runService(log, c)
+	runService(log, c, r)
 }
 
 // runInteractive runs the client with OS signal handling for graceful shutdown.
 // Used on all platforms when running directly in a terminal (not as a service daemon).
-func runInteractive(log *slog.Logger, c *client.Client) {
+func runInteractive(log *slog.Logger, c *client.Client, r *runner.Runner) {
 	updater.Start(config.Version, log, c.Drain)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		sig := <-sigCh
 		log.Info("received signal, shutting down", "signal", sig)
+		r.Shutdown()
 		os.Exit(0)
 	}()
 	c.RunForever()
