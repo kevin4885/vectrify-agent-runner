@@ -226,20 +226,17 @@ func (r *Runner) handleFileTransfer(cmdID string, raw protocol.RawCommand, send 
 // ── Browser ────────────────────────────────────────────────────────────────
 
 // handleBrowser dispatches one "browser" command to the shared
-// BrowserManager. Gated by cfg.AllowBrowser, mirroring AllowShell's gating
-// pattern in intent (though enforced entirely runner-side here — unlike
-// shell, the API has no separate allow_browser flag to check before
-// sending, so the runner is the only enforcement point).
-//
-// Every action operates on a session_id supplied by the caller; the first
-// action referencing a new session_id implicitly creates it (see
-// BrowserManager.getOrCreateSession), except "close" which is a no-op for
-// an unknown session_id rather than an error.
+// BrowserManager. Gated by cfg.AllowShell — browser automation is treated
+// as an extension of shell-level trust rather than its own permission:
+// there is deliberately no separate allow_browser setting, no installer
+// prompt, and no API-side allow_browser flag/toggle. Any runner that has
+// shell enabled can also drive a browser once the one-time
+// `-install-browsers` step has been run on that machine.
 func (r *Runner) handleBrowser(cmdID string, raw protocol.RawCommand, send func(interface{})) {
-	if !r.cfg.AllowBrowser {
+	if !r.cfg.AllowShell {
 		send(protocol.ResultMsg{
 			CmdID: cmdID, Type: "result", OK: false,
-			Error: "browser commands are disabled on this runner (allow_browser=false in config.yaml)",
+			Error: "browser commands require allow_shell=true in config.yaml (browser automation shares the shell permission — there is no separate allow_browser setting)",
 		})
 		return
 	}

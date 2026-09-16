@@ -81,7 +81,7 @@ All messages are JSON over the WebSocket.
 ### Runner → API (on connect)
 ```json
 { "type": "register", "platform": "linux", "workspace_root": "/home/user/projects",
-  "allow_shell": true, "allow_browser": false, "version": "1.0.0" }
+  "allow_shell": true, "version": "1.0.0" }
 ```
 
 ### API → Runner (ack)
@@ -135,9 +135,13 @@ All messages are JSON over the WebSocket.
 - `overwrite`: download only — if the destination already exists and `overwrite=false` the command fails with a descriptive error.
 
 **browser notes:**
-- Gated by `allow_browser` in config.yaml (default `false`) — mirrors `allow_shell`'s
-  secure-by-default pattern. Unlike shell, there is no separate API-side check; the
-  runner is the sole enforcement point.
+- Gated by `allow_shell` in config.yaml — browser automation shares the shell
+  permission rather than having its own flag. There is deliberately no
+  `allow_browser` setting: any runner that trusts the agent with a real shell
+  already trusts it with equivalent (or greater) local-machine capability, so
+  a separate toggle would add config surface without a real security
+  boundary. Unlike shell, there is no separate API-side check; the runner is
+  the sole enforcement point.
 - `session_id` is caller-supplied and identifies a stateful browser session (one
   Chromium `BrowserContext` + `Page`) that persists across multiple `browser` commands
   until explicitly closed (`action: "close"`) or reaped after `browser_idle_timeout_seconds`
@@ -184,9 +188,6 @@ max_heavy_concurrency: 24               # sub-limit for "heavy" commands (shell,
                                          # heavy slot is occupied
 slot_acquire_timeout_seconds: 3         # how long a command waits for a free slot before being
                                          # rejected as "runner busy", instead of rejecting instantly
-allow_browser:         false            # set true to enable Playwright browser commands (opt-in;
-                                         # requires `vectrify-runner -install-browsers` first — see
-                                         # "Browser automation" below)
 max_browser_sessions:  3                # max concurrent browser sessions (each = one Chromium
                                          # BrowserContext + Page kept alive across commands)
 browser_idle_timeout_seconds: 300       # auto-close a browser session after this many seconds of
@@ -196,26 +197,28 @@ browser_headless:      true             # false only for local debugging on a ma
 
 All three concurrency knobs are optional; the defaults shown above match the
 hardcoded behavior from before they became configurable, so an existing
-config.yaml with none of these keys set behaves identically. The four
-`allow_browser`/`max_browser_sessions`/`browser_idle_timeout_seconds`/
-`browser_headless` keys are likewise all optional — an existing config.yaml
-with none of them set boots with browser commands disabled and every other
-behavior unchanged.
+config.yaml with none of these keys set behaves identically. The three
+`max_browser_sessions`/`browser_idle_timeout_seconds`/`browser_headless` keys
+are likewise all optional — an existing config.yaml with none of them set
+uses the defaults shown above and behaves identically. There is no
+`allow_browser` key: browser commands are gated by `allow_shell` (see
+"Browser automation" below).
 
 ---
 
 ## Browser automation
 
-Gated behind `allow_browser` (default `false`), the `browser` command type lets the
-API drive a real Chromium browser on the runner machine — navigate, click, fill,
-screenshot, extract text/HTML, evaluate JS — via
+Gated by `allow_shell` — there is deliberately no separate `allow_browser`
+setting. The `browser` command type lets the API drive a real Chromium
+browser on the runner machine — navigate, click, fill, screenshot, extract
+text/HTML, evaluate JS — via
 [`github.com/mxschmitt/playwright-go`](https://github.com/mxschmitt/playwright-go).
 See the "browser notes" in the Command protocol section above for the full action list.
 
 ### One-time setup
 
-Before setting `allow_browser: true`, download the Playwright driver + Chromium browser
-binaries once per machine (~300 MB):
+Before enabling `allow_shell: true` on a machine you also want browser support on,
+download the Playwright driver + Chromium browser binaries once per machine (~300 MB):
 
 ```powershell
 # Windows
@@ -345,7 +348,7 @@ as assets on the GitHub Release. The one-liner install commands always pull from
    versions is unreadable by the non-root service user and the daemon fails
    immediately with "permission denied" on startup.
 5. **Key never logged** — `runner_key` is used only in the WebSocket URL; it is never written to log files.
-6. **Browser gating** — `browser` commands are blocked at the runner level if `allow_browser=false` (default). Screenshot destinations are subject to the same path-containment rule as `file_op` (invariant #1). No separate API-side check exists for this flag (unlike `allow_shell`) — the runner is the sole enforcement point.
+6. **Browser gating** — `browser` commands share `allow_shell`'s gating (no separate `allow_browser` setting exists) — blocked at the runner level if `allow_shell=false`. Screenshot destinations are subject to the same path-containment rule as `file_op` (invariant #1). No separate API-side check exists for browser commands (unlike shell) — the runner is the sole enforcement point.
 
 ---
 

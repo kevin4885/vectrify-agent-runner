@@ -144,16 +144,6 @@ type Config struct {
 	// several tool calls at once. Defaults to 3.
 	SlotAcquireTimeoutSeconds int `yaml:"slot_acquire_timeout_seconds"`
 
-	// AllowBrowser enables the "browser" command type (Playwright-driven
-	// browser automation — navigate, click, fill, screenshot, extract text,
-	// evaluate JS). When false (the default), browser commands are rejected
-	// with a clear error, mirroring AllowShell's gating pattern. Requires
-	// the browser driver + Chromium binaries to already be installed on
-	// this machine (see `vectrify-runner -install-browsers`); enabling this
-	// flag without running that step first will surface a clear error the
-	// first time a browser command is attempted, not at startup.
-	AllowBrowser bool `yaml:"allow_browser"`
-
 	// MaxBrowserSessions caps how many browser sessions (each one Chromium
 	// BrowserContext + Page kept alive across multiple "browser" commands)
 	// may be open at the same time. Defaults to 3.

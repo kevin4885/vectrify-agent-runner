@@ -261,20 +261,8 @@ workspace_root: .
 	}
 }
 
-// ── Browser config (allow_browser gating + tunables) ─────────────────────
-
-// AllowBrowser defaults to false — mirrors AllowShell's secure-by-default
-// gating pattern; browser commands must be explicitly opted into.
-func TestLoad_AllowBrowser_DefaultsFalse(t *testing.T) {
-	path := writeTestConfig(t, minimalValidConfig)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.AllowBrowser {
-		t.Errorf("AllowBrowser = true, want false by default")
-	}
-}
+// ── Browser config (tunables only — no allow_browser; browser commands
+//    are gated by allow_shell, see runner/runner.go handleBrowser) ────────
 
 func TestLoad_BrowserDefaults_AppliedWhenAbsent(t *testing.T) {
 	path := writeTestConfig(t, minimalValidConfig)
@@ -298,7 +286,6 @@ func TestLoad_BrowserDefaults_AppliedWhenAbsent(t *testing.T) {
 
 func TestLoad_BrowserExplicitValues_Honored(t *testing.T) {
 	path := writeTestConfig(t, minimalValidConfig+`
-allow_browser: true
 max_browser_sessions: 2
 browser_idle_timeout_seconds: 60
 browser_headless: false
@@ -306,9 +293,6 @@ browser_headless: false
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
-	}
-	if !cfg.AllowBrowser {
-		t.Errorf("AllowBrowser = false, want true")
 	}
 	if cfg.MaxBrowserSessions != 2 {
 		t.Errorf("MaxBrowserSessions = %d, want 2", cfg.MaxBrowserSessions)

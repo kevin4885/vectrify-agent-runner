@@ -30,7 +30,7 @@ import (
 )
 
 func main() {
-	installBrowsers := flag.Bool("install-browsers", false, "Download the Playwright driver + Chromium browser binaries needed for browser commands (allow_browser: true), then exit. Run this once per machine before enabling allow_browser.")
+	installBrowsers := flag.Bool("install-browsers", false, "Download the Playwright driver + Chromium browser binaries needed for browser commands, then exit. Run this once per machine to enable browser commands (browser automation is gated by allow_shell — there is no separate allow_browser setting).")
 	configPath := flag.String("config", "", "Path to config.yaml (default: ~/.vectrify-runner/config.yaml)")
 	flag.Parse()
 
@@ -40,7 +40,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error installing browsers: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("Done. You can now set allow_browser: true in config.yaml.")
+		fmt.Println("Done. Browser commands are now available on runners with allow_shell: true.")
 		os.Exit(0)
 	}
 
@@ -99,7 +99,6 @@ func main() {
 		"platform",       config.Platform(),
 		"workspace_root", cfg.WorkspaceRoot,
 		"allow_shell",    cfg.AllowShell,
-		"allow_browser",  cfg.AllowBrowser,
 	)
 
 	r := runner.New(cfg, log)

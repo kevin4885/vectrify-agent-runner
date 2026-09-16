@@ -248,7 +248,6 @@ func (c *Client) connect() error {
 		Platform:      config.Platform(),
 		WorkspaceRoot: c.cfg.WorkspaceRoot,
 		AllowShell:    c.cfg.AllowShell,
-		AllowBrowser:  c.cfg.AllowBrowser,
 		Version:       config.Version,
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(writeDeadline))

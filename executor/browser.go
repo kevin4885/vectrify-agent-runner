@@ -4,9 +4,10 @@
 // of stateful sessions that persist across multiple commands until closed
 // or reaped for inactivity.
 //
-// Gated behind config.AllowBrowser (mirrors AllowShell's gating pattern —
-// see runner/runner.go handleBrowser). Requires the Playwright driver +
-// Chromium binaries to already be installed on this machine; see
+// Gated behind config.AllowShell (see runner/runner.go handleBrowser) —
+// browser automation shares the shell permission rather than having its
+// own allow_browser setting. Requires the Playwright driver + Chromium
+// binaries to already be installed on this machine; see
 // `vectrify-runner -install-browsers` in main.go.
 //
 // Stealth: every launched context disables the Blink automation-controlled

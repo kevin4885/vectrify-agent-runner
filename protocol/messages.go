@@ -21,11 +21,13 @@
 //	                required from the user.
 //	browser       — Playwright-driven browser automation (navigate, click,
 //	                fill, screenshot, extract text/HTML, evaluate JS),
-//	                requires allow_browser=true. Actions operate on a
-//	                caller-supplied session_id; a session persists across
-//	                multiple commands until explicitly closed or reaped for
-//	                inactivity. See runner/runner.go handleBrowser and
-//	                executor/browser.go for the full action list.
+//	                requires allow_shell=true (shares the shell permission —
+//	                there is no separate allow_browser setting). Actions
+//	                operate on a caller-supplied session_id; a session
+//	                persists across multiple commands until explicitly
+//	                closed or reaped for inactivity. See runner/runner.go
+//	                handleBrowser and executor/browser.go for the full
+//	                action list.
 package protocol
 
 // ── Outbound (Runner → API) ────────────────────────────────────────────────────
@@ -36,7 +38,6 @@ type RegisterMsg struct {
 	Platform      string `json:"platform"`       // "linux" | "darwin" | "windows"
 	WorkspaceRoot string `json:"workspace_root"` // absolute path configured by the user
 	AllowShell    bool   `json:"allow_shell"`    // mirrors config.AllowShell
-	AllowBrowser  bool   `json:"allow_browser"`  // mirrors config.AllowBrowser
 	Version       string `json:"version"`        // runner app semver, e.g. "1.0.0"
 }
 
