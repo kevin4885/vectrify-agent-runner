@@ -382,7 +382,16 @@ if [ "$PRE_INSTALL_BROWSERS" = "true" ]; then
     # actual service user instead so the pre-install lands where the
     # running service will actually look for it.
     if [ -n "$ORIGINAL_USER" ] && [ "$ORIGINAL_USER" != "root" ]; then
-        if ! sudo -u "$ORIGINAL_USER" "$INSTALL_BIN" -install-browsers; then
+        # -H resets HOME to ORIGINAL_USER's home directory explicitly.
+        # Without it, whether HOME is reset at all depends on the target's
+        # sudoers env_reset/always_set_home/env_keep configuration -- on a
+        # host that preserves HOME, the outer `sudo ./install.sh` already
+        # set HOME=/root, and plain `sudo -u "$ORIGINAL_USER"` would
+        # silently inherit that, downloading Chromium into /root's cache
+        # instead of the service account's -- exactly the bug this
+        # pre-install step exists to avoid, just moved from "always wrong"
+        # to "wrong depending on sudoers policy". -H makes it unconditional.
+        if ! sudo -H -u "$ORIGINAL_USER" "$INSTALL_BIN" -install-browsers; then
             echo "  Browser install failed -- browser commands will auto-install on first use instead."
         fi
     else

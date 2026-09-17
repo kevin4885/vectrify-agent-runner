@@ -280,7 +280,7 @@ The log file is created on first run. If it never appears, the service failed to
 |---|---|
 | **Path containment** | Every file path is resolved to absolute, then checked against `workspace_root` before any I/O. Rejects `../` traversal. |
 | **Shell gating** | Shell execution is blocked unless `allow_shell: true` in config. The API also enforces this independently. |
-| **Browser gating** | Browser automation is blocked unless `allow_shell: true` in config — there is no separate `allow_browser` setting; browser commands share the shell permission. Screenshot destinations are subject to the same path containment rule as file operations. |
+| **Browser gating** | Browser automation is blocked unless `allow_shell: true` in config — there is no separate `allow_browser` setting; browser commands share the shell permission. Screenshot *writes* are subject to the same path containment rule as file operations; `goto` only accepts `http`/`https` URLs. Browser *reads* (via an allowed http/https URL) are bounded by `allow_shell` trust, not `workspace_root` — same as anything reachable via shell. |
 | **Outbound only** | The runner makes one outbound WebSocket connection. No ports are listened on. |
 | **Run as regular user** | The service runs as the account you choose during install (defaults to whoever runs the installer) on Windows, and as the installing user on Linux/macOS — never `LocalSystem`/root, and never a privileged superuser beyond what the installer itself requires. See "Windows service account" in CLAUDE.md for how this is configured and its password-rotation caveat. |
 | **Key never logged** | The `runner_key` is used only in the WebSocket URL query string and is never written to log output. |

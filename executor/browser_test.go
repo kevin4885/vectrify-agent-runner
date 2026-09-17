@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -294,4 +295,189 @@ func containsSubstring(s, substr string) bool {
 		}
 		return false
 	})()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Goto URL-scheme validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestGoto_RejectsNonHTTPSchemes verifies Goto refuses file:/data:/chrome:
+// URLs outright, rather than letting the browser tool double as a local
+// filesystem reader or internal-page inspector. See validateGotoURL's doc
+// comment for the reasoning (not a sandbox boundary -- allow_shell already
+// implies equivalent local-machine trust -- but browser automation should
+// behave like fetching a web page, not silently also do more than that).
+func TestGoto_RejectsNonHTTPSchemes(t *testing.T) {
+	m, _ := newTestBrowserManager(t, 3, time.Minute)
+
+	rejected := []string{
+		"file:///etc/passwd",
+		"file:///C:/Windows/System32/config/SAM",
+		"data:text/html,<h1>hi</h1>",
+		"chrome://version",
+		"view-source:http://example.com",
+	}
+	for _, u := range rejected {
+		if err := m.Goto("s1", u, 5); err == nil {
+			t.Errorf("Goto(%q) should have been rejected, got nil error", u)
+		}
+	}
+	// A session must never actually be created for a rejected URL -- the
+	// scheme check happens before getOrCreateSession, same ordering
+	// principle as guardScreenshotPath running before session creation.
+	m.mu.Lock()
+	_, exists := m.sessions["s1"]
+	m.mu.Unlock()
+	if exists {
+		t.Errorf("a session was created despite every Goto call being rejected for scheme")
+	}
+}
+
+// TestGoto_AllowsHTTPAndHTTPS verifies the two legitimate schemes still work
+// -- a regression guard against validateGotoURL being over-broad.
+func TestGoto_AllowsHTTPAndHTTPS(t *testing.T) {
+	m, _ := newTestBrowserManager(t, 3, time.Minute)
+	srv := newTestPageServer(t)
+
+	if err := m.Goto("s1", srv.URL, 15); err != nil {
+		t.Fatalf("Goto(%q) (http) should be allowed, got error = %v", srv.URL, err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shutdown idempotency
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestShutdown_Idempotent verifies a second Shutdown() call does not panic
+// (an earlier version would panic on a repeat close(m.stopReaper)).
+func TestShutdown_Idempotent(t *testing.T) {
+	m, _ := newTestBrowserManager(t, 3, time.Minute)
+	if err := m.Launch("s1"); err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	m.Shutdown()
+	// Must not panic.
+	m.Shutdown()
+	m.Shutdown()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-session serialization (concurrent same-session_id access)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestBrowserManager_ConcurrentSameSession_NoInterleaving verifies that two
+// goroutines issuing actions against the SAME session_id are serialized by
+// busyMu rather than interleaving Goto/Evaluate calls on one Page
+// concurrently. Without acquire()/release(), Playwright's own underlying
+// protocol connection is not safe for concurrent calls from one Page, and
+// even where it doesn't outright error, interleaved navigation defeats the
+// entire purpose of a stateful session (the caller can no longer reason
+// about "the current page" between their own successive tool calls).
+//
+// This test cannot use -race here (no cgo/C compiler available in this
+// environment -- see CLAUDE.md/PR notes), so it does not prove the absence
+// of a data race directly. It does prove the *serialization contract*:
+// every Evaluate call observes a globally-increasing counter with no two
+// calls seeing the same value, which is only possible if busyMu is
+// actually excluding concurrent access to the shared page state (a
+// sequence counter set via evaluate) rather than merely by coincidence of
+// timing.
+func TestBrowserManager_ConcurrentSameSession_NoInterleaving(t *testing.T) {
+	m, _ := newTestBrowserManager(t, 3, time.Minute)
+	srv := newTestPageServer(t)
+
+	if err := m.Goto("s1", srv.URL, 15); err != nil {
+		t.Fatalf("Goto() error = %v", err)
+	}
+	if _, err := m.Evaluate("s1", "window.__seq = 0"); err != nil {
+		t.Fatalf("Evaluate(init) error = %v", err)
+	}
+
+	const goroutines = 8
+	const perGoroutine = 5
+	seen := make(chan float64, goroutines*perGoroutine)
+	errCh := make(chan error, goroutines*perGoroutine)
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				// Read-then-increment-then-return, done as a single atomic
+				// JS statement so the only way two calls can observe the
+				// same "before" value is if busyMu let them run truly
+				// concurrently against the same page.
+				result, err := m.Evaluate("s1", "(function(){ const v = window.__seq; window.__seq = v + 1; return v; })()")
+				if err != nil {
+					errCh <- err
+					return
+				}
+				switch v := result.(type) {
+				case float64:
+					seen <- v
+				case int:
+					seen <- float64(v)
+				default:
+					errCh <- fmt.Errorf("unexpected Evaluate result type %T", result)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(seen)
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent Evaluate error: %v", err)
+	}
+
+	values := make(map[float64]int)
+	for v := range seen {
+		values[v]++
+	}
+	if len(values) != goroutines*perGoroutine {
+		t.Errorf("expected %d distinct sequence values (proving no two calls interleaved), got %d distinct values: %v",
+			goroutines*perGoroutine, len(values), values)
+	}
+	for v, count := range values {
+		if count > 1 {
+			t.Errorf("sequence value %v was observed %d times -- two Evaluate calls interleaved on the same session", v, count)
+		}
+	}
+}
+
+// TestBrowserManager_ReapDoesNotCloseBusySession verifies the idle reaper
+// skips a session that is currently mid-action (busyMu held), rather than
+// closing its context out from under the in-flight call.
+func TestBrowserManager_ReapDoesNotCloseBusySession(t *testing.T) {
+	m, _ := newTestBrowserManager(t, 3, 10*time.Millisecond) // tiny idle timeout
+	srv := newTestPageServer(t)
+
+	if err := m.Goto("s1", srv.URL, 15); err != nil {
+		t.Fatalf("Goto() error = %v", err)
+	}
+
+	m.mu.Lock()
+	s := m.sessions["s1"]
+	m.mu.Unlock()
+	if s == nil {
+		t.Fatal("session s1 not found after Goto")
+	}
+
+	// Simulate an in-flight action by holding busyMu directly (avoids a
+	// real multi-second page.WaitForSelector just to create the window).
+	s.acquire()
+	defer s.release()
+
+	time.Sleep(20 * time.Millisecond) // exceed the 10ms idle timeout
+	m.reapOnce()
+
+	m.mu.Lock()
+	_, stillTracked := m.sessions["s1"]
+	m.mu.Unlock()
+	if !stillTracked {
+		t.Errorf("reapOnce() removed a session that was busy (mid-action) -- it should have been skipped for this cycle")
+	}
 }

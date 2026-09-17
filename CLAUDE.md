@@ -70,7 +70,7 @@ vectrify-agent-runner/
 | Shell (Linux/macOS) | bash -c "..." |
 | Shell (Windows) | powershell -NoProfile -NonInteractive -Command "..." |
 | Browser automation | github.com/mxschmitt/playwright-go (opt-in, see below) |
-| Stealth evasions | github.com/jonfriesen/playwright-go-stealth (embedded JS only, see below) |
+| Stealth evasions | vendored `executor/stealth.min.js` (sourced from jonfriesen/playwright-go-stealth, not a Go dependency — see below) |
 
 ---
 
@@ -258,9 +258,13 @@ Every launched browser context:
 - disables the Blink automation-controlled flag (`--disable-blink-features=AutomationControlled`)
 - uses a realistic desktop Chrome UA string, viewport, locale, and timezone (instead of
   Playwright's own defaults, which are themselves a bot-detection signal)
-- injects the evasion script from
+- injects the evasion script vendored at `executor/stealth.min.js` (unmodified,
+  sourced from
   [`github.com/jonfriesen/playwright-go-stealth`](https://github.com/jonfriesen/playwright-go-stealth)
-  (the extracted `puppeteer-extra-plugin-stealth` evasions) into every new page
+  v0.0.3 — the extracted `puppeteer-extra-plugin-stealth` evasions; see
+  `executor/stealth.min.js.LICENSE`) into every new browser context via
+  `ctx.AddInitScript(...)`, so it also covers popups and `target=_blank` pages
+  opened later in that context
 
 **This raises the bar against basic/medium bot detection — it is NOT a guarantee
 against advanced systems** (Cloudflare Turnstile with behavioral scoring, Akamai,
@@ -268,19 +272,22 @@ PerimeterX/DataDome). Those fingerprint TLS/JA3, canvas/audio noise, and mouse/t
 behavior in ways a generic stealth layer cannot fully spoof, and it is a permanent
 cat-and-mouse game with no guarantee either way.
 
-**Implementation note (module-path gotcha):** `executor/browser.go` imports
-`github.com/jonfriesen/playwright-go-stealth` only for its embedded `stealth.StealthJS`
-string constant, injected via our own `page.AddInitScript(...)` call — NOT via that
-package's own `stealth.Inject(page)` helper. That helper's signature is pinned to the
-older `github.com/playwright-community/playwright-go` module path, which Go treats as a
+**Implementation note (vendored, not imported):** `stealth.min.js` is vendored
+directly via `//go:embed` rather than importing `github.com/jonfriesen/playwright-go-stealth`
+as a Go dependency. That package itself depends on the older
+`github.com/playwright-community/playwright-go` module path, which Go treats as a
 completely different type identity than `github.com/mxschmitt/playwright-go` (same
 upstream project, renamed on GitHub over time — the code lineage is identical but the
-two module paths are NOT interchangeable to the Go compiler). The newer module path is
-required here because the driver version pinned by the old path's latest tagged release
-(`v0.4201.1`) points at Playwright driver binaries Microsoft no longer hosts —
-`playwright.Install()` against it 404s. If `playwright-go-stealth` ever ships a release
-pinned to the newer module path, switching to its `Inject()` helper directly would be a
-safe simplification.
+two module paths are NOT interchangeable to the Go compiler; the newer module path is
+required here because the driver version pinned by the old path's latest tagged release,
+`v0.4201.1`, points at Playwright driver binaries Microsoft no longer hosts —
+`playwright.Install()` against it 404s). Vendoring the JS file directly and calling
+`AddInitScript` ourselves reaches the exact same runtime behavior as that package's own
+`Inject()` helper, with one fewer dependency (and its transitive sub-dependencies —
+`go-jose`, `go.uber.org/multierr`, `golang.org/x/exp` — previously compiled into the
+binary purely to reach one embedded string) and no module-path caveat to carry forward.
+To pick up an upstream update to the evasion script, re-copy `stealth.min.js` from a
+newer `playwright-go-stealth` release — there is no dependency to bump.
 
 ---
 
@@ -367,7 +374,7 @@ as assets on the GitHub Release. The one-liner install commands always pull from
    versions is unreadable by the non-root service user and the daemon fails
    immediately with "permission denied" on startup.
 5. **Key never logged** — `runner_key` is used only in the WebSocket URL; it is never written to log files.
-6. **Browser gating** — `browser` commands share `allow_shell`'s gating (no separate `allow_browser` setting exists) — blocked at the runner level if `allow_shell=false`. Screenshot destinations are subject to the same path-containment rule as `file_op` (invariant #1). No separate API-side check exists for browser commands (unlike shell) — the runner is the sole enforcement point.
+6. **Browser gating** — `browser` commands share `allow_shell`'s gating (no separate `allow_browser` setting exists) — blocked at the runner level if `allow_shell=false`. Screenshot *writes* are subject to the same path-containment rule as `file_op` (invariant #1). Browser *reads* are not similarly contained: `goto` only accepts `http`/`https` URLs (rejecting `file:`, `data:`, `chrome:`, etc. outright — see executor/browser.go's `validateGotoURL`), but an allowed `http(s)` URL can still reach loopback/link-local addresses (e.g. cloud metadata endpoints) the same way `curl` could under `allow_shell: true` — this is bounded by the same shell-level trust as everything else here, not by `workspace_root`. No separate API-side check exists for browser commands (unlike shell) — the runner is the sole enforcement point.
 
 ---
 

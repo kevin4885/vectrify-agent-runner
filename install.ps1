@@ -114,6 +114,26 @@ function Install-VectrifyRunner {
         Write-Host ""
         $st = (Get-Service $ServiceName).Status
         Write-Host "  $ServiceName : $st" -ForegroundColor $(if ($st -eq "Running") { "Green" } else { "Yellow" })
+
+        # This update path only swaps the binary and restarts -- it never
+        # re-registers the service identity. A service already running as
+        # LocalSystem (installed before this account-based install existed,
+        # or from an even older release) stays LocalSystem forever unless
+        # someone runs a full re-install with credentials. Flag that rather
+        # than silently leaving the operator to assume this update brought
+        # them the new "runs as your account" behaviour.
+        try {
+            $wmiSvc = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -EA SilentlyContinue
+            if ($wmiSvc -and $wmiSvc.StartName -match 'LocalSystem') {
+                Write-Host ""
+                Write-Host "  Note: this service still runs as LocalSystem (from an older install)." -ForegroundColor Yellow
+                Write-Host "  To switch it to run as a specific account instead, remove the service" -ForegroundColor Yellow
+                Write-Host "  (sc.exe delete $ServiceName) and run this installer fresh." -ForegroundColor Yellow
+            }
+        } catch {
+            # Best-effort notice only -- never fail the update over this.
+        }
+
         Write-Host ""
         if ($downloaded) { Remove-Item $src -EA 0 }
         return
@@ -299,20 +319,6 @@ public class VectrifyLsaHelper {
 
     $svcCred = New-Object System.Management.Automation.PSCredential($svcAccount, $svcPasswordSecure)
 
-    if ($preInstallBrowsers) {
-        Write-Host "  [1b/6] Installing browser automation (Chromium, ~300MB)..."
-        # Run as $svcAccount, not the interactive installer's account --
-        # Playwright's browser cache lives under the *running user's* home
-        # directory, and the service will run as $svcAccount, so installing
-        # under any other account would silently go to waste (the service
-        # would just auto-install again itself on first real use).
-        $installProc = Start-Process -FilePath $ExeDest -ArgumentList "-install-browsers" `
-            -Credential $svcCred -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
-        if (-not $installProc -or $installProc.ExitCode -ne 0) {
-            Write-Host "  Browser install failed -- browser commands will auto-install on first use instead." -ForegroundColor Yellow
-        }
-    }
-
     Write-Host "  [2/6] Writing config..."      -NoNewline
     New-Item -ItemType Directory -Force $ConfigDir | Out-Null
     @"
@@ -344,7 +350,39 @@ log_file:              $LogFile
     # Mirrors what install.sh does with chown for the Linux/macOS service user.
     icacls $InstallDir /grant "${svcAccount}:(OI)(CI)RX" | Out-Null
     icacls $ConfigDir  /grant "${svcAccount}:(OI)(CI)M"  | Out-Null
+    # config.yaml holds runner_key -- install.sh deliberately chmod 700/600s
+    # its equivalent for exactly that reason. The two /grant calls above only
+    # *add* permissions on top of ProgramData's normal inherited ACL, which
+    # commonly still leaves other local accounts able to read the file; break
+    # inheritance and grant only SYSTEM, Administrators, and svcAccount, to
+    # reach the same real-world protection Linux/macOS already has.
+    icacls $ConfigFile /inheritance:r `
+        /grant "SYSTEM:F" /grant "Administrators:F" /grant "${svcAccount}:R" | Out-Null
     Write-Host " done" -ForegroundColor Green
+
+    if ($preInstallBrowsers) {
+        Write-Host "  [4b/6] Installing browser automation (Chromium, ~300MB)..."
+        # Deliberately run this AFTER granting Log on as a service and
+        # setting folder permissions (steps 3-4), not before -- Start-Process
+        # -Credential needs the account to be able to authenticate and,
+        # separately, $InstallDir's RX grant to actually execute the binary;
+        # running this earlier worked by relying on Program Files' inherited
+        # Users:(RX) ACL, which isn't guaranteed on every machine, and any
+        # failure was silently swallowed by -ErrorAction SilentlyContinue.
+        # Running it here, after both grants are confirmed in place, makes
+        # it deterministic instead of incidentally working.
+        #
+        # Run as $svcAccount, not the interactive installer's account --
+        # Playwright's browser cache lives under the *running user's* home
+        # directory, and the service will run as $svcAccount, so installing
+        # under any other account would silently go to waste (the service
+        # would just auto-install again itself on first real use).
+        $installProc = Start-Process -FilePath $ExeDest -ArgumentList "-install-browsers" `
+            -Credential $svcCred -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+        if (-not $installProc -or $installProc.ExitCode -ne 0) {
+            Write-Host "  Browser install failed -- browser commands will auto-install on first use instead." -ForegroundColor Yellow
+        }
+    }
 
     Write-Host "  [5/6] Registering service..." -NoNewline
     $svc = Get-Service $ServiceName -EA SilentlyContinue

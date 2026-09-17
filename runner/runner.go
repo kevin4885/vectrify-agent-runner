@@ -279,6 +279,18 @@ func (r *Runner) handleBrowser(cmdID string, raw protocol.RawCommand, send func(
 		return
 	}
 
+	// Clamp any caller-supplied timeout the same way handleShell does —
+	// prevents a rogue or buggy payload (e.g. timeout_seconds: 999999) from
+	// parking a heavy dispatch slot for an unbounded duration. Applied
+	// uniformly here rather than per-action since every action below reads
+	// timeout_seconds the same way.
+	if raw["timeout_seconds"] != nil {
+		requested := protocol.Int(raw["timeout_seconds"])
+		if time.Duration(requested)*time.Second > maxShellTimeout {
+			raw["timeout_seconds"] = int(maxShellTimeout.Seconds())
+		}
+	}
+
 	var data string
 	var err error
 
@@ -355,9 +367,9 @@ func (r *Runner) handleBrowser(cmdID string, raw protocol.RawCommand, send func(
 		data, err = r.browser.GetContent(sessionID)
 
 	case "evaluate":
-		expression, _ := raw["expression"].(string)
+		expression, _ := raw["script"].(string)
 		if expression == "" {
-			err = fmt.Errorf("expression is required for evaluate")
+			err = fmt.Errorf("script is required for evaluate")
 			break
 		}
 		var result interface{}
@@ -389,9 +401,20 @@ func (r *Runner) handleBrowser(cmdID string, raw protocol.RawCommand, send func(
 	if installLog.Len() > 0 {
 		// Same rationale as the failure path above: a "result"-terminated
 		// command's preceding StreamMsg chunks are otherwise invisible to
-		// the caller, so fold the one-time install log into the success
-		// data instead of losing it silently.
-		data = installLog.String() + "\n" + data
+		// the caller. But unlike the failure path, several actions here
+		// return machine-parsed data (evaluate's JSON, content's HTML,
+		// get_text's raw extracted text) that a prepended log would
+		// corrupt for any caller parsing it — so only fold the log into
+		// the human-readable confirmation actions, never into the actions
+		// whose `data` is meant to be consumed as-is.
+		switch action {
+		case "get_text", "content", "evaluate":
+			// Leave data untouched — the install log was already streamed
+			// via StreamMsg above, so it isn't lost, just not duplicated
+			// into a payload the caller will try to parse.
+		default:
+			data = installLog.String() + "\n" + data
+		}
 	}
 	send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: true, Data: data})
 }
