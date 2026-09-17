@@ -325,6 +325,12 @@ done
 # allow_shell
 ALLOW_SHELL="$(read_yesno "Allow shell commands?" "n")"
 
+# browser automation pre-install (optional -- auto-installs on first use otherwise)
+PRE_INSTALL_BROWSERS="false"
+if [ "$ALLOW_SHELL" = "true" ]; then
+    PRE_INSTALL_BROWSERS="$(read_yesno "  Also pre-install browser automation now? (downloads ~300MB Chromium; optional -- it auto-installs on first use otherwise)" "n")"
+fi
+
 # log_level
 LOG_LEVEL="$(read_choice "Log level" "info debug warn error" "info")"
 
@@ -343,6 +349,11 @@ echo "  ----------------------------------------"
 echo "  workspace_root : $WORKSPACE_ROOT"
 echo "  runner_key     : $KEY_PREVIEW"
 echo "  allow_shell    : $ALLOW_SHELL"
+if [ "$PRE_INSTALL_BROWSERS" = "true" ]; then
+    echo "  browser        : pre-installing now (~300MB)"
+elif [ "$ALLOW_SHELL" = "true" ]; then
+    echo "  browser        : auto-installs on first use (no action needed)"
+fi
 echo "  log_level      : $LOG_LEVEL"
 echo "  backoff        : $BACKOFF s"
 echo "  install path   : $INSTALL_BIN"
@@ -359,6 +370,30 @@ echo ""
 printf "  [1/4] Installing binary..."
 install -m 755 "$SRC" "$INSTALL_BIN"
 echo " done"
+
+if [ "$PRE_INSTALL_BROWSERS" = "true" ]; then
+    echo "  [1b/4] Installing browser automation (Chromium, ~300MB)..."
+    # The Playwright browser cache installs under the *running user's* home
+    # directory (~/.cache/ms-playwright). This script runs under sudo as
+    # root, but the systemd/launchd service runs as ORIGINAL_USER (see the
+    # chown below) — installing as root here would populate root's cache,
+    # not the service account's, silently wasting the download (the service
+    # would just auto-install again itself on first real use). Run as the
+    # actual service user instead so the pre-install lands where the
+    # running service will actually look for it.
+    if [ -n "$ORIGINAL_USER" ] && [ "$ORIGINAL_USER" != "root" ]; then
+        if ! sudo -u "$ORIGINAL_USER" "$INSTALL_BIN" -install-browsers; then
+            echo "  Browser install failed -- browser commands will auto-install on first use instead."
+        fi
+    else
+        # No non-root ORIGINAL_USER resolved (e.g. run directly as root, not
+        # via sudo) — the service will also run as root in that case, so
+        # installing as the current user (root) is actually correct here.
+        if ! "$INSTALL_BIN" -install-browsers; then
+            echo "  Browser install failed -- browser commands will auto-install on first use instead."
+        fi
+    fi
+fi
 
 # ── Step 2: Write config ──────────────────────────────────────────────────────
 printf "  [2/4] Writing config..."

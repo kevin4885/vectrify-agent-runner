@@ -30,7 +30,7 @@ import (
 )
 
 func main() {
-	installBrowsers := flag.Bool("install-browsers", false, "Download the Playwright driver + Chromium browser binaries needed for browser commands, then exit. Run this once per machine to enable browser commands (browser automation is gated by allow_shell — there is no separate allow_browser setting).")
+	installBrowsers := flag.Bool("install-browsers", false, "Download the Playwright driver + Chromium browser binaries needed for browser commands, then exit. Optional — the runner auto-installs these on the first browser command if missing, so this flag is only useful to pre-warm the install (avoid the ~300MB download delay on that first command) or to run it ahead of time during provisioning. Browser automation is gated by allow_shell — there is no separate allow_browser setting.")
 	configPath := flag.String("config", "", "Path to config.yaml (default: ~/.vectrify-runner/config.yaml)")
 	flag.Parse()
 

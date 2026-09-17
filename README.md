@@ -38,11 +38,13 @@ iwr -useb https://github.com/kevin4885/vectrify-agent-runner/releases/latest/dow
 ```
 
 The installer will ask for:
+- **Windows only: which account to run the service as** — defaults to whoever is running the installer; you can type a different local account name instead. You'll also be prompted for that account's password (needed to register the service to run as it — see "Windows service account" in CLAUDE.md).
 - **Workspace root folder** — the directory agents are allowed to work in (all file operations are confined here)
 - **Runner key** — the `vrun_...` key from Step 1
 - **Allow shell commands** — whether to permit `runner_shell` commands (default: no)
+- **If shell is enabled: pre-install browser automation now?** — optional; downloads ~300 MB of Chromium immediately instead of on the first browser command later (default: no)
 
-It then installs the binary, writes the config, and registers and starts a system service automatically.
+It then installs the binary, writes the config, and registers and starts a system service automatically — on Linux/macOS running as the user who ran the installer (not root); on Windows running as the account you chose above (not `LocalSystem`).
 
 ### What gets installed
 
@@ -125,7 +127,7 @@ Config is written by the installer. To change a setting, edit the file and resta
 | Flag | Default | Description |
 |---|---|---|
 | `--config` | platform default | Path to the YAML config file |
-| `-install-browsers` | — | Downloads the Playwright driver + Chromium binaries (~300 MB) needed for browser commands, then exits. Run once per machine to enable browser commands (requires `allow_shell: true` — see Browser automation below) |
+| `-install-browsers` | — | Downloads the Playwright driver + Chromium binaries (~300 MB) needed for browser commands, then exits. Optional — browser commands auto-install these on first use if missing, so this is only useful to pre-warm the install and avoid that delay on the first real command (requires `allow_shell: true` — see Browser automation below) |
 
 ---
 
@@ -136,7 +138,12 @@ navigate, click, fill forms, take screenshots, extract text/HTML, run JS — via
 Playwright. Gated by `allow_shell` — there is no separate `allow_browser`
 setting; any runner with shell enabled can also drive a browser.
 
-**Setup (once per machine):**
+**No manual setup required.** The first browser command on a machine
+automatically downloads the Playwright driver + Chromium (~300 MB), streaming
+progress back like a long shell command, then proceeds — every command after
+that is instant. If you'd rather not pay that delay on whichever command
+happens to run first, pre-warm it instead: `install.ps1`/`install.sh` offer to
+do this during setup (only asked if you enable shell mode), or run it directly:
 ```powershell
 # Windows
 .\vectrify-runner.exe -install-browsers
@@ -145,7 +152,6 @@ setting; any runner with shell enabled can also drive a browser.
 # Linux / macOS
 ./vectrify-runner -install-browsers
 ```
-Then ensure `allow_shell: true` is set in config.yaml and restart the service.
 
 Every browser session applies basic stealth measures (realistic user agent,
 disabled automation flags, injected evasion script) to reduce detection by
@@ -276,5 +282,5 @@ The log file is created on first run. If it never appears, the service failed to
 | **Shell gating** | Shell execution is blocked unless `allow_shell: true` in config. The API also enforces this independently. |
 | **Browser gating** | Browser automation is blocked unless `allow_shell: true` in config — there is no separate `allow_browser` setting; browser commands share the shell permission. Screenshot destinations are subject to the same path containment rule as file operations. |
 | **Outbound only** | The runner makes one outbound WebSocket connection. No ports are listened on. |
-| **Run as regular user** | The service runs as `LocalSystem` on Windows and as the installing user on Linux/macOS — never as a privileged superuser beyond what the installer requires. |
+| **Run as regular user** | The service runs as the account you choose during install (defaults to whoever runs the installer) on Windows, and as the installing user on Linux/macOS — never `LocalSystem`/root, and never a privileged superuser beyond what the installer itself requires. See "Windows service account" in CLAUDE.md for how this is configured and its password-rotation caveat. |
 | **Key never logged** | The `runner_key` is used only in the WebSocket URL query string and is never written to log output. |

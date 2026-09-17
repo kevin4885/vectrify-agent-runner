@@ -44,6 +44,61 @@ func newTestPageServer(t *testing.T) *httptest.Server {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// EnsureInstalled
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The full auto-install download path (driver missing -> playwright.Install()
+// -> retry) is intentionally NOT exercised here: it downloads ~300MB over the
+// network, which is far too slow and flaky for a unit test run on every CI
+// build. It was validated manually against a real isolated fake-HOME
+// directory during development (see PR description / commit message) rather
+// than as an automated test. This test instead locks in the fast path that
+// every other test in this file already exercises implicitly through
+// Launch/Goto (getOrCreateSession -> ensureStarted -> doEnsureInstalled(nil)):
+// once the browser is already running, EnsureInstalled must be a fast no-op
+// that never touches the progress channel.
+func TestBrowserManager_EnsureInstalled_FastPathNoProgress(t *testing.T) {
+	m, _ := newTestBrowserManager(t, 3, time.Minute)
+
+	// Start the browser via a normal action first (this machine already has
+	// the Playwright driver installed, matching the common case), then call
+	// EnsureInstalled directly and confirm the already-started fast path
+	// emits nothing on the progress channel.
+	if err := m.Launch("s1"); err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	defer m.Close("s1")
+
+	progressCh := make(chan InstallProgress, 16)
+	done := make(chan error, 1)
+	go func() {
+		done <- m.EnsureInstalled(progressCh)
+		close(progressCh)
+	}()
+
+	var gotProgress bool
+	for range progressCh {
+		gotProgress = true
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("EnsureInstalled() (fast path) error = %v", err)
+	}
+	if gotProgress {
+		t.Errorf("EnsureInstalled() sent progress chunks on the already-started fast path, want none")
+	}
+}
+
+// EnsureInstalled must tolerate a nil progress channel (the no-progress-
+// reporting caller, e.g. ensureStarted's internal fallback) without panicking
+// or blocking.
+func TestBrowserManager_EnsureInstalled_NilProgressChannel(t *testing.T) {
+	m, _ := newTestBrowserManager(t, 3, time.Minute)
+	if err := m.EnsureInstalled(nil); err != nil {
+		t.Fatalf("EnsureInstalled(nil) error = %v", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 

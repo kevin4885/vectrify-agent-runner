@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"vectrify/agent-runner/config"
@@ -228,16 +229,46 @@ func (r *Runner) handleFileTransfer(cmdID string, raw protocol.RawCommand, send 
 // handleBrowser dispatches one "browser" command to the shared
 // BrowserManager. Gated by cfg.AllowShell — browser automation is treated
 // as an extension of shell-level trust rather than its own permission:
-// there is deliberately no separate allow_browser setting, no installer
-// prompt, and no API-side allow_browser flag/toggle. Any runner that has
-// shell enabled can also drive a browser once the one-time
-// `-install-browsers` step has been run on that machine.
+// there is deliberately no separate allow_browser setting.
+//
+// Before dispatching to any action, it calls BrowserManager.EnsureInstalled,
+// which auto-downloads the Playwright driver + Chromium browser the first
+// time browser automation is ever used on this machine (streaming progress
+// back as the same StreamMsg chunks a shell command uses for stdout), so
+// the customer never has to run an install step by hand. Every subsequent
+// call is a near-instant no-op once installed.
 func (r *Runner) handleBrowser(cmdID string, raw protocol.RawCommand, send func(interface{})) {
 	if !r.cfg.AllowShell {
 		send(protocol.ResultMsg{
 			CmdID: cmdID, Type: "result", OK: false,
 			Error: "browser commands require allow_shell=true in config.yaml (browser automation shares the shell permission — there is no separate allow_browser setting)",
 		})
+		return
+	}
+
+	progressCh := make(chan executor.InstallProgress, 16)
+	installDone := make(chan error, 1)
+	go func() {
+		installDone <- r.browser.EnsureInstalled(progressCh)
+		close(progressCh)
+	}()
+	var installLog strings.Builder
+	for p := range progressCh {
+		installLog.WriteString(p.Data)
+		send(protocol.StreamMsg{CmdID: cmdID, Type: "stream", Stream: "stdout", Data: p.Data})
+	}
+	if err := <-installDone; err != nil {
+		errMsg := fmt.Sprintf("browser driver unavailable: %s", err.Error())
+		if installLog.Len() > 0 {
+			// Prepend the partial install log so the caller sees what was
+			// attempted, not just the final failure. Needed because the API's
+			// send_command() helper only accumulates stream chunks for a
+			// "done"-terminated command (shell's convention); a "result"
+			// terminal message like this one would otherwise silently drop
+			// everything sent via StreamMsg above.
+			errMsg = installLog.String() + "\n" + errMsg
+		}
+		send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: false, Error: errMsg})
 		return
 	}
 
@@ -354,6 +385,13 @@ func (r *Runner) handleBrowser(cmdID string, raw protocol.RawCommand, send func(
 	if err != nil {
 		send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: false, Error: err.Error()})
 		return
+	}
+	if installLog.Len() > 0 {
+		// Same rationale as the failure path above: a "result"-terminated
+		// command's preceding StreamMsg chunks are otherwise invisible to
+		// the caller, so fold the one-time install log into the success
+		// data instead of losing it silently.
+		data = installLog.String() + "\n" + data
 	}
 	send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: true, Data: data})
 }

@@ -97,17 +97,85 @@ func NewBrowserManager(workspaceRoot string, maxSessions int, idleTimeout time.D
 
 // ensureStarted lazily starts the Playwright driver + Chromium browser the
 // first time it is needed, and starts the idle-reaper goroutine exactly
-// once. Must be called with mu held.
+// once. Must be called with mu held. Thin wrapper around EnsureInstalled
+// with no progress channel — used by the normal action path
+// (getOrCreateSession) where the driver is virtually always already
+// installed (EnsureInstalled having been called explicitly by
+// runner.handleBrowser first); kept as a self-healing fallback for any
+// call path that skips that explicit call.
 func (m *BrowserManager) ensureStarted() error {
+	return m.doEnsureInstalled(nil)
+}
+
+// EnsureInstalled makes sure the Playwright driver + Chromium browser are
+// installed and the shared browser process is running — installing them
+// automatically (streaming progress text on progressCh, if non-nil) the
+// first time this is ever called on a given machine, instead of requiring
+// the customer to have run `vectrify-runner -install-browsers` by hand.
+//
+// Call this explicitly (with a progress channel) at the top of
+// runner.handleBrowser, before dispatching to any action, so the ~300MB
+// one-time download streams back to the caller instead of the command
+// silently hanging for up to a couple of minutes on a customer's very
+// first browser command. Safe to call on every command — it is an
+// near-instant no-op once the browser is already running.
+func (m *BrowserManager) EnsureInstalled(progressCh chan<- InstallProgress) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.doEnsureInstalled(progressCh)
+}
+
+// doEnsureInstalled is the actual implementation, called with mu already held.
+func (m *BrowserManager) doEnsureInstalled(progressCh chan<- InstallProgress) error {
 	if m.browser != nil {
-		return nil
+		return nil // already started — fast path, no install needed
 	}
+
 	pw, err := playwright.Run()
-	if err != nil {
-		return fmt.Errorf(
-			"starting playwright driver: %w (has `vectrify-runner -install-browsers` been run on this machine?)", err,
-		)
+	if err == nil {
+		return m.finishStart(pw)
 	}
+	if !strings.Contains(err.Error(), "install the driver") {
+		// A different failure (e.g. a corrupt partial install, or a
+		// permissions problem) — auto-installing over it is unlikely to
+		// help and could mask the real cause, so surface it as-is rather
+		// than silently attempting an install.
+		return fmt.Errorf("starting playwright driver: %w", err)
+	}
+
+	// First-ever browser command on this machine: the driver isn't
+	// installed. Auto-install it now instead of making the customer run
+	// `vectrify-runner -install-browsers` by hand.
+	if progressCh != nil {
+		progressCh <- InstallProgress{
+			Data: "Playwright driver not found on this machine — installing now " +
+				"(one-time download, ~300MB, may take a couple of minutes)...\n",
+		}
+	}
+	w := &progressWriter{ch: progressCh}
+	if err := playwright.Install(&playwright.RunOptions{
+		Stdout:   w,
+		Stderr:   w,
+		Verbose:  true,
+		Browsers: []string{"chromium"}, // only Chromium is used by BrowserManager; skip Firefox/WebKit to keep this a ~300MB download, not ~600MB+
+	}); err != nil {
+		return fmt.Errorf("auto-installing playwright driver: %w", err)
+	}
+	if progressCh != nil {
+		progressCh <- InstallProgress{Data: "\nInstall complete.\n"}
+	}
+
+	pw, err = playwright.Run()
+	if err != nil {
+		return fmt.Errorf("starting playwright driver after auto-install: %w", err)
+	}
+	return m.finishStart(pw)
+}
+
+// finishStart launches Chromium given an already-running Playwright driver
+// connection and starts the idle reaper. Called with mu held, from either
+// the already-installed fast path or right after a fresh auto-install.
+func (m *BrowserManager) finishStart(pw *playwright.Playwright) error {
 	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
 		Headless: playwright.Bool(m.headless),
 		// Reduces one of the more visible automation fingerprints
@@ -125,6 +193,32 @@ func (m *BrowserManager) ensureStarted() error {
 	m.browser = browser
 	m.reaperOnce.Do(func() { go m.reapIdleLoop() })
 	return nil
+}
+
+// InstallProgress carries one chunk of stdout/stderr text produced while
+// EnsureInstalled auto-downloads the Playwright driver + Chromium browser.
+// Mirrors executor.ShellChunk's role for shell commands — runner.go
+// forwards each chunk to the API as a protocol.StreamMsg.
+type InstallProgress struct {
+	Data string
+}
+
+// progressWriter adapts an io.Writer to forward each Write call's bytes as
+// one InstallProgress chunk on ch, so playwright.Install()'s own
+// stdout/stderr streams back to the caller in near-real-time instead of
+// the multi-minute download silently blocking with no signal. A nil ch
+// (EnsureInstalled called without a progress channel, e.g. via
+// ensureStarted's fallback path) discards writes — Install() itself still
+// runs and blocks normally either way.
+type progressWriter struct {
+	ch chan<- InstallProgress
+}
+
+func (w *progressWriter) Write(p []byte) (int, error) {
+	if w.ch != nil {
+		w.ch <- InstallProgress{Data: string(p)}
+	}
+	return len(p), nil
 }
 
 // reapIdleLoop periodically closes sessions that have been idle longer than

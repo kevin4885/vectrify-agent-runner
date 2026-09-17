@@ -119,6 +119,91 @@ function Install-VectrifyRunner {
         return
     }
 
+    # -- LSA helper: grant "Log on as a service" to a local account ------------
+    # New-Service -Credential creates the service fine even without this right,
+    # but the service then fails to actually start (logon failure) until the
+    # account has SeServiceLogonRight -- regular user accounts (including the
+    # one running this installer) do NOT have it by default; only interactive
+    # logon rights are implied by normal account creation. There is no
+    # PowerShell cmdlet for this -- it requires the LSA policy API directly.
+    function Grant-ServiceLogonRight([string]$AccountName) {
+        $sig = @'
+using System;
+using System.Runtime.InteropServices;
+
+public class VectrifyLsaHelper {
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool LookupAccountName(string lpSystemName, string lpAccountName,
+        byte[] Sid, ref int cbSid, byte[] ReferencedDomainName, ref int cchReferencedDomainName, out int peUse);
+
+    [DllImport("advapi32.dll", SetLastError = true, PreserveSig = true)]
+    public static extern uint LsaOpenPolicy(ref LSA_UNICODE_STRING SystemName, ref LSA_OBJECT_ATTRIBUTES Attributes, int AccessMask, out IntPtr PolicyHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true, PreserveSig = true)]
+    public static extern uint LsaAddAccountRights(IntPtr PolicyHandle, byte[] AccountSid, LSA_UNICODE_STRING[] UserRights, int CountOfRights);
+
+    [DllImport("advapi32.dll")]
+    public static extern int LsaClose(IntPtr ObjectHandle);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LSA_UNICODE_STRING {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LSA_OBJECT_ATTRIBUTES {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public int Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+
+    // POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES -- the minimum access mask
+    // that permits LsaAddAccountRights; POLICY_ALL_ACCESS is not required and
+    // (perhaps counter-intuitively) is more likely to be denied.
+    const int POLICY_CREATE_ACCOUNT = 0x00000010;
+    const int POLICY_LOOKUP_NAMES   = 0x00000800;
+
+    public static void AddRight(string accountName, string right) {
+        int sidSize = 0, domainSize = 0, use;
+        LookupAccountName(null, accountName, null, ref sidSize, null, ref domainSize, out use);
+        byte[] sid = new byte[sidSize];
+        byte[] domain = new byte[domainSize * 2];
+        if (!LookupAccountName(null, accountName, sid, ref sidSize, domain, ref domainSize, out use))
+            throw new Exception("LookupAccountName failed for '" + accountName + "': " + Marshal.GetLastWin32Error());
+
+        LSA_UNICODE_STRING system = new LSA_UNICODE_STRING();
+        LSA_OBJECT_ATTRIBUTES attrs = new LSA_OBJECT_ATTRIBUTES();
+        IntPtr policyHandle;
+        uint res = LsaOpenPolicy(ref system, ref attrs, POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES, out policyHandle);
+        if (res != 0) throw new Exception("LsaOpenPolicy failed: " + res);
+
+        try {
+            LSA_UNICODE_STRING rightStr = new LSA_UNICODE_STRING();
+            rightStr.Buffer = Marshal.StringToHGlobalUni(right);
+            rightStr.Length = (ushort)(right.Length * 2);
+            rightStr.MaximumLength = (ushort)((right.Length + 1) * 2);
+
+            LSA_UNICODE_STRING[] rights = new LSA_UNICODE_STRING[] { rightStr };
+            res = LsaAddAccountRights(policyHandle, sid, rights, 1);
+            if (res != 0) throw new Exception("LsaAddAccountRights failed: " + res);
+        } finally {
+            LsaClose(policyHandle);
+        }
+    }
+}
+'@
+        if (-not ("VectrifyLsaHelper" -as [type])) {
+            Add-Type -TypeDefinition $sig -Language CSharp
+        }
+        [VectrifyLsaHelper]::AddRight($AccountName, "SeServiceLogonRight")
+    }
+
+
     # ── Prompt helpers ────────────────────────────────────────────────────────
     function Ask-Required([string]$Label) {
         while ($true) {
@@ -155,6 +240,16 @@ function Install-VectrifyRunner {
     Write-Host "  Configure the runner:" -ForegroundColor White
     Write-Host ""
 
+    $currentUser = "$env:USERDOMAIN\$env:USERNAME"
+    while ($true) {
+        $svcAccount = Ask-Default "Run the service as which account?" $currentUser
+        if ($svcAccount -match '\\') { break }
+        # Bare "name" (no domain\ prefix) -- assume local machine, matching
+        # how Get-CimInstance/sc.exe report and accept local accounts.
+        $svcAccount = "$env:COMPUTERNAME\$svcAccount"
+        break
+    }
+    $svcPasswordSecure = Read-Host "  Password for $svcAccount" -AsSecureString
     while ($true) {
         $workspaceRoot = Ask-Required "Workspace root folder"
         if (Test-Path $workspaceRoot -PathType Container) { break }
@@ -167,6 +262,10 @@ function Install-VectrifyRunner {
         Write-Host "  Must start with vrun_" -ForegroundColor Yellow
     }
     $allowShell = Ask-YesNo  "Allow shell commands?" $false
+    $preInstallBrowsers = $false
+    if ($allowShell) {
+        $preInstallBrowsers = Ask-YesNo "  Also pre-install browser automation now? (downloads ~300MB Chromium; optional -- it auto-installs on first use otherwise)" $false
+    }
     $logLevel   = Ask-Choice "Log level" @("info","debug","warn","error") "info"
     while ($true) {
         $bs = Ask-Default "Max reconnect backoff seconds" "60"
@@ -178,20 +277,43 @@ function Install-VectrifyRunner {
 
     # ── Summary + confirm ─────────────────────────────────────────────────────
     Write-Host ""
+    Write-Host "  service   : runs as $svcAccount"
     Write-Host "  workspace : $workspaceRoot"
     Write-Host "  key       : $($runnerKey.Substring(0,[Math]::Min(8,$runnerKey.Length)))..."
     Write-Host "  shell     : $allowShellYaml  |  log: $logLevel  |  backoff: ${backoff}s"
+    if ($preInstallBrowsers) { Write-Host "  browser   : pre-installing now (~300MB)" }
+    elseif ($allowShell)     { Write-Host "  browser   : auto-installs on first use (no action needed)" }
+    Write-Host ""
+    Write-Host "  NOTE: if $svcAccount's Windows password ever changes, the service" -ForegroundColor DarkGray
+    Write-Host "  will fail to start on next reboot until you re-enter the new password" -ForegroundColor DarkGray
+    Write-Host "  (re-run this installer, or update it via services.msc -> Log On As)." -ForegroundColor DarkGray
     Write-Host ""
     if (-not (Ask-YesNo "Proceed?" $true)) { if ($downloaded) { Remove-Item $src -EA 0 }; return }
     Write-Host ""
 
     # ── Install ───────────────────────────────────────────────────────────────
-    Write-Host "  [1/5] Installing binary..."   -NoNewline
+    Write-Host "  [1/6] Installing binary..."   -NoNewline
     New-Item -ItemType Directory -Force $InstallDir | Out-Null
     Copy-Item -Force $src $ExeDest
     Write-Host " done" -ForegroundColor Green
 
-    Write-Host "  [2/5] Writing config..."      -NoNewline
+    $svcCred = New-Object System.Management.Automation.PSCredential($svcAccount, $svcPasswordSecure)
+
+    if ($preInstallBrowsers) {
+        Write-Host "  [1b/6] Installing browser automation (Chromium, ~300MB)..."
+        # Run as $svcAccount, not the interactive installer's account --
+        # Playwright's browser cache lives under the *running user's* home
+        # directory, and the service will run as $svcAccount, so installing
+        # under any other account would silently go to waste (the service
+        # would just auto-install again itself on first real use).
+        $installProc = Start-Process -FilePath $ExeDest -ArgumentList "-install-browsers" `
+            -Credential $svcCred -Wait -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+        if (-not $installProc -or $installProc.ExitCode -ne 0) {
+            Write-Host "  Browser install failed -- browser commands will auto-install on first use instead." -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "  [2/6] Writing config..."      -NoNewline
     New-Item -ItemType Directory -Force $ConfigDir | Out-Null
     @"
 api_url:               wss://api.vectrify.ai/api/v1/runner/ws
@@ -204,22 +326,39 @@ log_file:              $LogFile
 "@ | Set-Content -Encoding UTF8 $ConfigFile
     Write-Host " done" -ForegroundColor Green
 
-    Write-Host "  [3/5] Registering service..." -NoNewline
+    Write-Host "  [3/6] Granting Log on as a service..." -NoNewline
+    try {
+        Grant-ServiceLogonRight -AccountName $svcAccount
+        Write-Host " done" -ForegroundColor Green
+    } catch {
+        Write-Host " FAILED" -ForegroundColor Red
+        Write-Host "  $_" -ForegroundColor Red
+        Write-Host "  The service will likely fail to start. Grant 'Log on as a service' to" -ForegroundColor Yellow
+        Write-Host "  $svcAccount manually via secpol.msc and re-run, or re-run this installer." -ForegroundColor Yellow
+    }
+
+    Write-Host "  [4/6] Setting folder permissions..." -NoNewline
+    # $InstallDir and $ConfigDir are created under Program Files / ProgramData,
+    # both owned by Administrators by default -- $svcAccount needs explicit
+    # read access to the binary/config and write access to the log file.
+    # Mirrors what install.sh does with chown for the Linux/macOS service user.
+    icacls $InstallDir /grant "${svcAccount}:(OI)(CI)RX" | Out-Null
+    icacls $ConfigDir  /grant "${svcAccount}:(OI)(CI)M"  | Out-Null
+    Write-Host " done" -ForegroundColor Green
+
+    Write-Host "  [5/6] Registering service..." -NoNewline
     $svc = Get-Service $ServiceName -EA SilentlyContinue
     if ($svc) {
         if ($svc.Status -eq "Running") { Stop-Service $ServiceName -Force -EA 0; Start-Sleep 2 }
         sc.exe delete $ServiceName | Out-Null; Start-Sleep 1
     }
     New-Service -Name $ServiceName -DisplayName $ServiceDisplay -StartupType Automatic `
-        -BinaryPathName "`"$ExeDest`" --config `"$ConfigFile`"" | Out-Null
+        -BinaryPathName "`"$ExeDest`" --config `"$ConfigFile`"" -Credential $svcCred | Out-Null
     sc.exe description $ServiceName "Connects to Vectrify Cloud and executes agent commands on this machine." | Out-Null
     Write-Host " done" -ForegroundColor Green
 
-    Write-Host "  [4/5] Restart-on-failure..."  -NoNewline
+    Write-Host "  [6/6] Restart-on-failure + start..." -NoNewline
     sc.exe failure $ServiceName reset= 3600 actions= restart/5000/restart/10000/restart/30000 | Out-Null
-    Write-Host " done" -ForegroundColor Green
-
-    Write-Host "  [5/5] Starting service..."    -NoNewline
     Start-Service $ServiceName
     Write-Host " done" -ForegroundColor Green
 
@@ -231,7 +370,14 @@ log_file:              $LogFile
     Write-Host "  Done!" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  Logs : $LogFile"
+    Write-Host "  Runs as : $svcAccount"
     Write-Host ""
+    if ($st -ne "Running") {
+        Write-Host "  Service did not start. This is usually a wrong password or a logon-right" -ForegroundColor Yellow
+        Write-Host "  problem for $svcAccount. Re-run this installer to re-enter the password," -ForegroundColor Yellow
+        Write-Host "  or check services.msc -> $ServiceDisplay -> Log On As." -ForegroundColor Yellow
+        Write-Host ""
+    }
 
     if ($downloaded) { Remove-Item $src -EA 0 }
 }

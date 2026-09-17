@@ -215,10 +215,22 @@ text/HTML, evaluate JS — via
 [`github.com/mxschmitt/playwright-go`](https://github.com/mxschmitt/playwright-go).
 See the "browser notes" in the Command protocol section above for the full action list.
 
-### One-time setup
+### Installation
 
-Before enabling `allow_shell: true` on a machine you also want browser support on,
-download the Playwright driver + Chromium browser binaries once per machine (~300 MB):
+Nothing manual is required to enable browser automation once `allow_shell: true`
+is set — the first `browser` command on a given machine automatically downloads
+the Playwright driver + Chromium binaries (~300 MB, Chromium only — Firefox and
+WebKit are explicitly skipped) if they are not already present, streaming
+progress back on the command's stdout the same way a long shell command would,
+then proceeds with the original action once installed. Every command after
+that first one is a near-instant no-op. See `BrowserManager.EnsureInstalled` in
+`executor/browser.go` and `handleBrowser` in `runner/runner.go`.
+
+To avoid paying that ~300 MB delay on whichever command happens to run first,
+you can pre-warm the install instead — either interactively during
+`install.ps1`/`install.sh` (prompted only when shell mode is enabled), or by
+running the binary with `-install-browsers` directly, which exits immediately
+after downloading:
 
 ```powershell
 # Windows
@@ -229,9 +241,16 @@ download the Playwright driver + Chromium browser binaries once per machine (~30
 ./vectrify-runner -install-browsers
 ```
 
-This exits after downloading — it does not start the runner. Re-run it after any
-future Chromium version bump if browser commands start failing with a driver-version
-error.
+Both paths install into the *running user's* home directory
+(`~/.cache/ms-playwright` on Linux/macOS, `%LOCALAPPDATA%\ms-playwright` on
+Windows) — whoever the runner service actually runs as. This matters for the
+interactive installers specifically: `install.sh` runs under `sudo` as root
+but the systemd/launchd service runs as `ORIGINAL_USER`, and pre-1.x
+`install.ps1` ran the Windows service as `LocalSystem`, a different profile
+than whoever ran the installer interactively. Both installers now run the
+pre-install step as the actual service account (see "Windows service
+account" below) so a pre-install actually lands where the running service
+will look for it, rather than silently going to waste.
 
 ### Stealth
 
@@ -355,6 +374,33 @@ as assets on the GitHub Release. The one-liner install commands always pull from
 ## Running as a system service
 
 Use `install.ps1` (Windows) or `install.sh` (Linux/macOS) — they handle everything.
+
+### Windows service account
+
+The Windows service runs as the account that ran the installer by default (not
+`LocalSystem`), matching Linux/macOS where the systemd/launchd service already
+runs as `ORIGINAL_USER` rather than root. `install.ps1` prompts for which
+account to run as (defaulting to the current user) and that account's
+password, then:
+
+1. Grants `SeServiceLogonRight` to the account via the LSA policy API
+   (`Grant-ServiceLogonRight` in `install.ps1`) — regular user accounts do NOT
+   have this by default; only interactive logon rights are implied by normal
+   account creation, so `New-Service -Credential` alone is not sufficient —
+   the service is created fine but fails to actually start until this right
+   is granted.
+2. Sets ACLs on `$InstallDir` (read+execute) and `$ConfigDir` (modify) for
+   that account via `icacls`, mirroring what `install.sh` already does with
+   `chown` for the Linux/macOS service user — both directories are created
+   under `Program Files`/`ProgramData`, owned by Administrators by default.
+3. Creates the service with `New-Service -Credential`.
+
+**Password-rotation caveat (inherent to any Windows service run as a real user
+account rather than a built-in one):** if that account's Windows password ever
+changes later, the service will fail to start on next reboot until someone
+re-enters the new password — either by re-running `install.ps1`, or manually
+via `services.msc` → the service → Properties → Log On tab. This is documented
+in the install summary output at the end of a successful install.
 
 ### Service lifecycle (Windows)
 
