@@ -89,9 +89,39 @@ func checkAndApply(currentVersion string, log *slog.Logger, drain func(time.Dura
 		log.Debug("auto-update: up to date", "version", currentVersion)
 		return
 	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Warn("auto-update: could not resolve own executable path", "err", err)
+		return
+	}
+
+	// See lock.go's ROOT-CAUSE NOTE: this lock is the fix that guarantees
+	// two runner processes on the same machine (e.g. a freshly
+	// SCM/systemd/launchd-restarted old binary racing a still-mid-update
+	// old binary) can never both attempt to swap the same file at once.
+	lock, err := acquireUpdateLock(exePath)
+	if err != nil {
+		log.Warn("auto-update: failed to acquire update lock; skipping this cycle", "err", err)
+		return
+	}
+	if lock == nil {
+		log.Info("auto-update: another update is already in progress on this machine (lock held); skipping this cycle",
+			"current", currentVersion, "latest", latest)
+		return
+	}
+	// NOT deferred: apply() calls os.Exit on its own success path, and
+	// deferred functions never run through os.Exit. Correctness therefore
+	// relies on explicit release on every path instead:
+	//   - apply() returns an error       -> released right below by US.
+	//   - apply() succeeds and os.Exit's -> released by the detached
+	//     swap script apply() launches, AFTER the binary swap completes
+	//     (see apply_windows.go / apply_other.go) — not by any Go code,
+	//     since the process is gone by then.
 	log.Info("auto-update: new version available", "current", currentVersion, "latest", latest)
-	if err := apply(latest, rel.Assets, log, drain); err != nil {
+	if err := apply(exePath, latest, rel.Assets, log, drain, lock); err != nil {
 		log.Error("auto-update: failed", "err", err)
+		lock.release()
 	}
 }
 

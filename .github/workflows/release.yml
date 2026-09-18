@@ -37,6 +37,22 @@ jobs:
           GOOS=darwin  GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/vectrify-runner-darwin-amd64 .
           GOOS=darwin  GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/vectrify-runner-darwin-arm64 .
 
+      - name: Generate checksums
+        # Required by updater/apply_windows.go and apply_other.go: the
+        # auto-updater now REFUSES to install a release that has no
+        # checksums.txt (previously it warned and proceeded unverified —
+        # see the commit that added this step for why that's not
+        # acceptable). Every release from here on must include this file
+        # so installed runners can keep auto-updating.
+        run: |
+          cd dist
+          sha256sum vectrify-runner-windows-amd64.exe \
+                     vectrify-runner-linux-amd64 \
+                     vectrify-runner-linux-arm64 \
+                     vectrify-runner-darwin-amd64 \
+                     vectrify-runner-darwin-arm64 > checksums.txt
+          cat checksums.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -48,5 +64,6 @@ jobs:
             dist/vectrify-runner-linux-arm64
             dist/vectrify-runner-darwin-amd64
             dist/vectrify-runner-darwin-arm64
+            dist/checksums.txt
             install.sh
             install.ps1

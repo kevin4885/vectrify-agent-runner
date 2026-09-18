@@ -234,6 +234,9 @@ GitHub Actions builds all 5 binaries and publishes them as a GitHub Release auto
 
 ## Troubleshooting
 
+**`... is not a valid Win32 application` in Event Viewer after an auto-update, or the service won't start after an update**
+This was a real bug (fixed in versions after v1.0.17): the auto-updater could trigger the Windows service to be treated as "crashed" and auto-restarted mid-update, causing two update flows to corrupt the binary by writing to it at the same time. Versions after the fix prevent this from happening again (see CLAUDE.md's "Auto-update" section for the full mechanism). If you hit this: stop the service, download the latest release binary directly from GitHub Releases, replace `C:\Program Files\VectrifyRunner\vectrify-runner.exe` with it, and start the service again.
+
 **`bash: /dev/fd/NN: Bad file descriptor` when installing**
 You ran the installer as `sudo bash <(curl -fsSL ...)`. Process substitution doesn't survive `sudo`'s fd handling. Download the script first, then run it: `curl -fsSLO .../install.sh && sudo bash install.sh` (see Step 2 above).
 

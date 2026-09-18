@@ -52,6 +52,14 @@ vectrify-agent-runner/
 │   ├── file_transfer.go   File transfer via presigned S3 URLs (download runner←S3, upload runner→S3)
 │   ├── shell.go           Shell execution (bash/PowerShell) + structured git operations
 │   └── browser.go         Playwright-driven browser automation (opt-in, see "Browser automation" below)
+├── updater/
+│   ├── updater.go         Background auto-update loop: checks GitHub releases hourly, downloads +
+│   │                      verifies the new binary, hands off to a platform swap script (see
+│   │                      "Auto-update" below — has a subtle cross-platform gotcha, read before touching)
+│   ├── lock.go            Cross-process update lock (prevents two runner processes on the same
+│   │                      machine from swapping the binary at the same time)
+│   ├── apply_windows.go   Windows: SCM-aware swap (build tag: windows)
+│   └── apply_other.go     Linux/macOS: systemd/launchd-aware swap (build tag: !windows)
 └── runner/
     └── runner.go          Command dispatch loop — routes cmd_type to executor, formats responses
 ```
@@ -352,9 +360,81 @@ git push origin v1.0.0
 ```
 
 GitHub Actions (`.github/workflows/release.yml`) triggers automatically, builds all
-5 platform binaries, and publishes them along with `install.sh` and `install.ps1`
-as assets on the GitHub Release. The one-liner install commands always pull from
-`releases/latest/download/` so users get the newest version automatically.
+5 platform binaries, generates `checksums.txt` for them, and publishes them all —
+plus `install.sh` and `install.ps1` — as assets on the GitHub Release. The one-liner
+install commands always pull from `releases/latest/download/` so users get the
+newest version automatically. `checksums.txt` is not optional: `updater/apply_*.go`
+refuses to install any release that doesn't have one (see "Auto-update" below).
+
+---
+
+## Auto-update
+
+Every installed runner (`updater.Start`, called from `main.go`/`service_windows.go`)
+checks GitHub for a newer release on startup and hourly thereafter, and self-updates
+in the background with no user interaction. High level: download the new binary,
+verify its SHA256 against `checksums.txt`, drain in-flight commands, hand off to a
+detached platform-specific script (PowerShell on Windows, bash on Linux/macOS) that
+swaps the binary and restarts the service, then exit.
+
+**The subtle, previously-production-breaking gotcha — read this before touching
+`updater/*.go`:** `install.ps1` configures Windows SCM restart-on-failure
+(`sc.exe failure ... actions=restart/...`); `install.sh` configures
+`Restart=always` (systemd) / `KeepAlive=true` (launchd). All three mean *"if this
+process ever exits without the supervisor itself having caused it, treat it as a
+crash and restart the (still-old) binary."* If `apply()` just calls `os.Exit(0)`
+directly to hand off to its swap script — which is exactly what it used to do —
+every one of those supervisors treats that as a crash, restarts the old binary
+within seconds, and that freshly-restarted process's own startup update check
+immediately detects the same new release and starts a **second, fully independent
+update flow** — racing the first flow's still-running swap script over the exact
+same file paths. This happened in production (`v1.0.17`) and corrupted the
+installed Windows binary (`... is not a valid Win32 application` on next launch),
+because both flows' `os.Create()` (truncates) and `Move-Item`/`mv` calls interleaved
+with zero coordination.
+
+Two independent, complementary fixes, both required — removing either one
+reopens this bug:
+
+1. **`updater/lock.go`** — a cross-process, atomic (`O_CREATE|O_EXCL`) lock file
+   next to the binary. A second `checkAndApply()` — however it got started — that
+   finds the lock already held (and not stale — see `staleLockAge`) skips its
+   update cycle entirely instead of racing the first. This is the guarantee that
+   holds *even if* the platform-specific mitigation below is ever imperfect on some
+   OS/supervisor version.
+2. **`updater/apply_windows.go` / `apply_other.go`** — before the terminal
+   `os.Exit(0)`, `apply()` makes the *supervisor itself* the cause of this
+   process's exit, instead of just exiting and hoping the supervisor doesn't
+   notice:
+   - **Windows**: runs `sc.exe stop VectrifyRunner`. That delivers a real Stop
+     control request back to *this same process's* own `service_windows.go`
+     `Execute()` dispatch loop, which already correctly reports `StopPending` to
+     the SCM before exiting — so the SCM sees an acknowledged stop, not a crash,
+     and the failure/restart policy never fires.
+   - **Linux (systemd)**: runs `systemctl stop vectrify-runner`. Per
+     `systemd.service(5)`: *"When the death of the process is a result of systemd
+     operation (e.g. service stop or restart), the service will not be
+     restarted"* — regardless of `Restart=always`. `systemctl stop` sends SIGTERM
+     to this process, the existing signal handler in `main.go`'s `runInteractive`
+     already handles that correctly (calls `Runner.Shutdown()`, then exits), and
+     because systemd itself initiated it, no restart follows.
+   - **macOS (launchd)**: **different rule from systemd** — a boolean
+     `KeepAlive=true` job restarts unconditionally on *any* exit, including one
+     caused by `launchctl stop`; there is no "this was requested" exception for
+     the boolean form. The only way to prevent the restart is `launchctl unload`
+     (removes the job from supervision entirely) instead of `stop`. `apply_other.go`
+     branches on `runtime.GOOS` for exactly this reason — don't unify the Linux and
+     macOS paths, they need genuinely different supervisor calls.
+   - Each swap script also does its own bounded poll-then-force-stop as an
+     idempotent safety net, and `apply()` sleeps a bounded fallback window
+     (`scmStopFallback` / `supervisorStopFallback`) before falling back to a
+     direct `os.Exit` if the supervisor-triggered stop somehow didn't land — `apply()`
+     must never hang indefinitely either.
+
+Also note: the temp download path is unique per attempt
+(`exePath + ".new." + pid + "." + timestamp"`, not a fixed `.new` suffix) as
+defense-in-depth — even with the lock, a fixed shared path is one less thing that
+has to go right for two attempts to never collide on the same file.
 
 ---
 
