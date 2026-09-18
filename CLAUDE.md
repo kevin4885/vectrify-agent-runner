@@ -20,7 +20,8 @@ Vectrify Cloud (AWS)                    Customer Machine
         runner_file_editor                    ├─ shell     (bash or PowerShell)
         runner_shell                          ├─ git       (structured git ops)
         runner_git                            ├─ file_transfer (S3 ↔ runner filesystem)
-                                               └─ browser   (Playwright automation, opt-in)
+        runner_browser                        ├─ browser   (Playwright automation, opt-in)
+        runner_process                        └─ process   (detached background processes, opt-in)
 ```
 
 ---
@@ -51,7 +52,9 @@ vectrify-agent-runner/
 │   ├── file_ops.go        File CRUD — read (with line numbers), write, str_replace, insert, delete
 │   ├── file_transfer.go   File transfer via presigned S3 URLs (download runner←S3, upload runner→S3)
 │   ├── shell.go           Shell execution (bash/PowerShell) + structured git operations
-│   └── browser.go         Playwright-driven browser automation (opt-in, see "Browser automation" below)
+│   ├── browser.go         Playwright-driven browser automation (opt-in, see "Browser automation" below)
+│   └── process.go         Long-lived, detached background processes (opt-in, see "Background
+│                          processes" below) — survives past the call that started it, unlike shell.go
 └── runner/
     └── runner.go          Command dispatch loop — routes cmd_type to executor, formats responses
 ```
@@ -112,6 +115,10 @@ All messages are JSON over the WebSocket.
 { "cmd_id": "uuid", "type": "browser", "action": "content",  "session_id": "s1" }
 { "cmd_id": "uuid", "type": "browser", "action": "evaluate", "session_id": "s1", "expression": "document.title" }
 { "cmd_id": "uuid", "type": "browser", "action": "close",    "session_id": "s1" }
+{ "cmd_id": "uuid", "type": "process", "action": "start", "process_id": "p1", "command": "npm run dev", "working_dir": "..." }
+{ "cmd_id": "uuid", "type": "process", "action": "stop",  "process_id": "p1" }
+{ "cmd_id": "uuid", "type": "process", "action": "list" }
+{ "cmd_id": "uuid", "type": "process", "action": "logs",  "process_id": "p1", "tail_lines": 100 }
 ```
 
 **update_key notes:**
@@ -157,6 +164,37 @@ All messages are JSON over the WebSocket.
 - Classified `heavy` in `client/classify.go` (shares the heavy concurrency sub-limit with
   `shell` and `file_transfer`).
 
+**process notes:**
+- Gated by `allow_shell` — same reasoning as `browser`: there is deliberately
+  no separate `allow_process` setting.
+- Exists specifically because a `shell` command CANNOT support "start a
+  long-lived process, then interact with it from a later, separate call" —
+  `executor/shell.go` kills its entire process tree unconditionally the
+  moment the starting command returns, even on a clean exit (see that
+  file's `ROOT-CAUSE NOTE` and `PRODUCT DECISION` comments — this is
+  deliberate for `shell`'s own request/response contract, not a bug). A
+  `process` command's whole reason to exist is to NOT do that.
+- `process_id` is caller-supplied and identifies one tracked process (like
+  `browser`'s `session_id`), capped at `max_background_processes`,
+  automatically reaped after `background_process_max_age_seconds` if never
+  explicitly stopped (safety net for a forgotten `stop`, not a normal code
+  path — see "Background processes" below for the intended lifecycle).
+- Actions: `start` (`command` interpreted the same way `shell`'s `command`
+  is — `bash -c` / `powershell -Command`; `working_dir` defaults to
+  `workspace_root`; fails fast if the process exits with a non-zero code
+  within ~300ms of starting, e.g. a bad executable or syntax error — a
+  process that starts fine and exits later, even seconds later, is not a
+  `start`-time error), `stop` (kills the whole tracked process tree if the
+  tracker attached successfully, otherwise just the direct child; idempotent
+  — stopping an unknown/already-stopped `process_id` is not an error), `list`
+  (every tracked process, running or recently exited, with PID/command/
+  working_dir/started_at and, once exited, exit code), `logs` (tail of
+  combined stdout+stderr from the process's log file; `tail_lines` <= 0
+  returns everything, capped at 200000 bytes from the end).
+- Classified `heavy` in `client/classify.go` (same reasoning as `shell` — a
+  process `start` is exactly the kind of external-process-spawn action that
+  sub-limit exists to bound).
+
 ### Runner → API (responses)
 ```json
 { "cmd_id": "uuid", "type": "result", "ok": true,  "data": "file content or output" }
@@ -193,16 +231,22 @@ max_browser_sessions:  3                # max concurrent browser sessions (each 
 browser_idle_timeout_seconds: 300       # auto-close a browser session after this many seconds of
                                          # inactivity (no command referencing its session_id)
 browser_headless:      true             # false only for local debugging on a machine with a display
+max_background_processes: 5             # max concurrent detached background processes (see
+                                         # "Background processes" below)
+background_process_max_age_seconds: 3600 # auto-stop/clean-up a background process (running or
+                                         # already exited) after this many seconds, if never
+                                         # explicitly stopped or retrieved
 ```
 
 All three concurrency knobs are optional; the defaults shown above match the
 hardcoded behavior from before they became configurable, so an existing
-config.yaml with none of these keys set behaves identically. The three
-`max_browser_sessions`/`browser_idle_timeout_seconds`/`browser_headless` keys
-are likewise all optional — an existing config.yaml with none of them set
-uses the defaults shown above and behaves identically. There is no
-`allow_browser` key: browser commands are gated by `allow_shell` (see
-"Browser automation" below).
+config.yaml with none of these keys set behaves identically. The
+`max_browser_sessions`/`browser_idle_timeout_seconds`/`browser_headless` and
+`max_background_processes`/`background_process_max_age_seconds` keys are
+likewise all optional — an existing config.yaml with none of them set uses
+the defaults shown above and behaves identically. There is no
+`allow_browser` or `allow_process` key: both command types are gated by
+`allow_shell` (see "Browser automation" and "Background processes" below).
 
 ---
 
@@ -291,6 +335,57 @@ newer `playwright-go-stealth` release — there is no dependency to bump.
 
 ---
 
+## Background processes
+
+Gated by `allow_shell` — there is deliberately no separate `allow_process`
+setting (same reasoning as browser automation above). The `process` command
+type lets the API start a long-lived process on the runner machine that
+survives PAST the single command that started it — e.g. a dev server —
+so it can be driven or verified by later, separate commands (most usefully
+`browser` ones) issued minutes apart, in a completely different tool call.
+
+**Why this needed its own command type instead of a `shell` flag:**
+`executor/shell.go` is built around one hard invariant — a shell command
+must always return, which it guarantees by killing the ENTIRE process tree
+the instant the command's own process exits or times out (see `shell.go`'s
+`ROOT-CAUSE NOTE`). That is not a limitation to work around; it is what
+makes `shell.go` safe to use as a blocking request/response primitive at
+all. A "leave it running" flag on `shell` would need a fundamentally
+different output-handling strategy (no live pipe to stream — the whole
+point is the descendant survives, so the pipe never reaches EOF) and would
+give `runner_shell` two contradictory contracts instead of one clear one.
+`process.go` reuses the exact same process-tree tracker (`procTreeIface` /
+`newProcTreeFn` — see `proc_windows.go` / `proc_other.go`) `shell.go` uses,
+but only ever calls `kill()` from an explicit `stop`, the max-age reaper, or
+runner `Shutdown()` — never automatically just because the *starting* call
+returned.
+
+**Typical workflow:** `process` `start` a dev server → `browser` `goto`/
+`click`/`screenshot` against it, any number of times, across any number of
+separate tool calls → `process` `stop` when done. See
+`app/engine/agent_engine/runner.py`'s system-prompt block in `vectrify-api`
+for how this is described to the LLM.
+
+**Lifecycle:**
+- A background process's lifetime is bounded by the RUNNER's own lifetime,
+  not left to survive it: `Runner.Shutdown()` kills every tracked process
+  (see `ProcessManager.Shutdown`) — including on the routine auto-update
+  restart cycle (see "Auto-update" above). There is no "survive a runner
+  restart" mode; a caller must re-`start` after one.
+- A forgotten `start` (no matching `stop`) is not permanently leaked: the
+  reaper force-stops (if still running) or cleans up (if already exited on
+  its own) any tracked process past `background_process_max_age_seconds`.
+  Defaults to a long window (1 hour) since this is meant for multi-step
+  workflows spread over real time, not a tight idle timeout like browser
+  sessions'.
+- Output is captured to a log file (stdout+stderr combined, in the order
+  written) under a runner-internal temp directory — NOT under
+  `workspace_root`, and not exposed as a path the caller operates on
+  directly (unlike a browser screenshot's `path`). Retrieve it only via the
+  `logs` action.
+
+---
+
 ## Building
 
 ```powershell
@@ -375,6 +470,7 @@ as assets on the GitHub Release. The one-liner install commands always pull from
    immediately with "permission denied" on startup.
 5. **Key never logged** — `runner_key` is used only in the WebSocket URL; it is never written to log files.
 6. **Browser gating** — `browser` commands share `allow_shell`'s gating (no separate `allow_browser` setting exists) — blocked at the runner level if `allow_shell=false`. Screenshot *writes* are subject to the same path-containment rule as `file_op` (invariant #1). Browser *reads* are not similarly contained: `goto` only accepts `http`/`https` URLs (rejecting `file:`, `data:`, `chrome:`, etc. outright — see executor/browser.go's `validateGotoURL`), but an allowed `http(s)` URL can still reach loopback/link-local addresses (e.g. cloud metadata endpoints) the same way `curl` could under `allow_shell: true` — this is bounded by the same shell-level trust as everything else here, not by `workspace_root`. No separate API-side check exists for browser commands (unlike shell) — the runner is the sole enforcement point.
+7. **Process gating** — `process` commands share `allow_shell`'s gating (no separate `allow_process` setting exists), same reasoning as invariant #6. A `process start` command is, in effect, an unattended `shell` command whose lifetime outlives the call that issued it — not a broader capability than `shell` already grants, just a longer-lived instance of it. `working_dir` is NOT path-contained (matches `shell`'s own `working_dir`, which isn't either) — both are already gated by the same full local-machine trust `allow_shell` implies.
 
 ---
 

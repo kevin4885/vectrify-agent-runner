@@ -26,10 +26,13 @@ func (c commandClass) String() string {
 //
 // heavy: commands that can legitimately run for a long time or block on
 // external I/O — "shell" (arbitrary user command, up to maxShellTimeout),
-// "file_transfer" (S3 upload/download of up to 100 MiB), and "browser"
+// "file_transfer" (S3 upload/download of up to 100 MiB), "browser"
 // (Playwright actions — page navigation and JS evaluation can legitimately
 // take many seconds, and a wedged/hung page would otherwise behave exactly
-// like the wedged-shell incident this mechanism was built to contain).
+// like the wedged-shell incident this mechanism was built to contain), and
+// "process" (starting/stopping/listing detached background processes —
+// same shell-level trust and, for "start", the same kind of external
+// process spawn as "shell").
 // These are exactly the command types that produced the original incident:
 // enough of them wedged simultaneously starved the fast, interactive
 // commands of every slot.
@@ -47,7 +50,7 @@ func (c commandClass) String() string {
 // made.
 func classifyCommand(cmdType string) commandClass {
 	switch cmdType {
-	case "shell", "file_transfer", "browser":
+	case "shell", "file_transfer", "browser", "process":
 		return classHeavy
 	default:
 		return classLight

@@ -261,6 +261,109 @@ workspace_root: .
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Background process (max_background_processes / background_process_max_age_seconds)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestLoad_BackgroundProcessDefaults(t *testing.T) {
+	path := writeTestConfig(t, minimalValidConfig)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.MaxBackgroundProcesses != defaultMaxBackgroundProcesses {
+		t.Errorf("MaxBackgroundProcesses = %d, want default %d", cfg.MaxBackgroundProcesses, defaultMaxBackgroundProcesses)
+	}
+	if cfg.BackgroundProcessMaxAgeSeconds != defaultBackgroundProcessMaxAgeSeconds {
+		t.Errorf("BackgroundProcessMaxAgeSeconds = %d, want default %d", cfg.BackgroundProcessMaxAgeSeconds, defaultBackgroundProcessMaxAgeSeconds)
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("Warnings = %v, want none for a config with no explicit background process tunables", cfg.Warnings)
+	}
+}
+
+func TestLoad_BackgroundProcessExplicitValues_Honored(t *testing.T) {
+	path := writeTestConfig(t, minimalValidConfig+`
+max_background_processes: 2
+background_process_max_age_seconds: 60
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.MaxBackgroundProcesses != 2 {
+		t.Errorf("MaxBackgroundProcesses = %d, want 2", cfg.MaxBackgroundProcesses)
+	}
+	if cfg.BackgroundProcessMaxAgeSeconds != 60 {
+		t.Errorf("BackgroundProcessMaxAgeSeconds = %d, want 60", cfg.BackgroundProcessMaxAgeSeconds)
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("Warnings = %v, want none", cfg.Warnings)
+	}
+}
+
+// max_background_processes above the sanity ceiling must be clamped down
+// (with a warning), not honored verbatim — same rationale as
+// max_browser_sessions' ceiling.
+func TestLoad_MaxBackgroundProcesses_AboveSaneCeiling_Clamps(t *testing.T) {
+	path := writeTestConfig(t, minimalValidConfig+`
+max_background_processes: 500
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.MaxBackgroundProcesses != maxSaneBackgroundProcesses {
+		t.Fatalf("MaxBackgroundProcesses = %d, want clamped to %d", cfg.MaxBackgroundProcesses, maxSaneBackgroundProcesses)
+	}
+	if len(cfg.Warnings) == 0 {
+		t.Fatal("Warnings is empty, want a warning about the max_background_processes clamp")
+	}
+}
+
+// background_process_max_age_seconds above the sanity ceiling must be
+// clamped down (with a warning) rather than letting a forgotten process
+// run indefinitely.
+func TestLoad_BackgroundProcessMaxAgeSeconds_AboveSaneCeiling_Clamps(t *testing.T) {
+	path := writeTestConfig(t, minimalValidConfig+`
+background_process_max_age_seconds: 99999999
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.BackgroundProcessMaxAgeSeconds != maxSaneBackgroundProcessMaxAgeSeconds {
+		t.Fatalf("BackgroundProcessMaxAgeSeconds = %d, want clamped to %d", cfg.BackgroundProcessMaxAgeSeconds, maxSaneBackgroundProcessMaxAgeSeconds)
+	}
+	if len(cfg.Warnings) == 0 {
+		t.Fatal("Warnings is empty, want a warning about the background_process_max_age_seconds clamp")
+	}
+}
+
+// Zero and negative background process tunables must fall back to
+// defaults, same self-correction pattern as the browser tunables above.
+func TestLoad_ZeroOrNegativeBackgroundProcessTunables_FallBackToDefaults(t *testing.T) {
+	cases := []string{
+		"max_background_processes: 0\nbackground_process_max_age_seconds: 0\n",
+		"max_background_processes: -1\nbackground_process_max_age_seconds: -1\n",
+	}
+	for _, extra := range cases {
+		t.Run(extra, func(t *testing.T) {
+			path := writeTestConfig(t, minimalValidConfig+extra)
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.MaxBackgroundProcesses <= 0 {
+				t.Errorf("MaxBackgroundProcesses = %d, want positive default", cfg.MaxBackgroundProcesses)
+			}
+			if cfg.BackgroundProcessMaxAgeSeconds <= 0 {
+				t.Errorf("BackgroundProcessMaxAgeSeconds = %d, want positive default", cfg.BackgroundProcessMaxAgeSeconds)
+			}
+		})
+	}
+}
+
 // ── Browser config (tunables only — no allow_browser; browser commands
 //    are gated by allow_shell, see runner/runner.go handleBrowser) ────────
 
