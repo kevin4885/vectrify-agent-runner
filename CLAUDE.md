@@ -55,11 +55,12 @@ vectrify-agent-runner/
 │   └── browser.go         Playwright-driven browser automation (opt-in, see "Browser automation" below)
 ├── updater/
 │   ├── updater.go         Background auto-update loop: checks GitHub releases hourly, downloads +
-│   │                      verifies the new binary, hands off to a platform swap script (see
+│   │                      verifies the new binary, then swaps it (Windows: in-process; Linux/macOS: script; see
 │   │                      "Auto-update" below — has a subtle cross-platform gotcha, read before touching)
 │   ├── lock.go            Cross-process update lock (prevents two runner processes on the same
 │   │                      machine from swapping the binary at the same time)
-│   ├── apply_windows.go   Windows: SCM-aware swap (build tag: windows)
+│   ├── apply_windows.go   Windows: in-process rename swap, no helper script (build tag: windows)
+│   ├── swap.go            Windows swap: rename running exe -> exe.old, move new exe in, roll back on failure
 │   └── apply_other.go     Linux/macOS: systemd/launchd-aware swap (build tag: !windows)
 └── runner/
     └── runner.go          Command dispatch loop — routes cmd_type to executor, formats responses
@@ -405,6 +406,10 @@ for how this is described to the LLM.
 go build -o vectrify-runner.exe .
 ```
 
+**Windows build flags matter for antivirus (do not "optimize" them away).** The Windows exe is
+built WITHOUT `-s -w` (stripped symbols make an unsigned Go binary look opaque to Microsoft
+Defender's ML classifier 
+
 ## Installing
 
 ### One-liner (recommended — downloads binary automatically from latest release)
@@ -466,9 +471,13 @@ refuses to install any release that doesn't have one (see "Auto-update" below).
 Every installed runner (`updater.Start`, called from `main.go`/`service_windows.go`)
 checks GitHub for a newer release on startup and hourly thereafter, and self-updates
 in the background with no user interaction. High level: download the new binary,
-verify its SHA256 against `checksums.txt`, drain in-flight commands, hand off to a
-detached platform-specific script (PowerShell on Windows, bash on Linux/macOS) that
-swaps the binary and restarts the service, then exit.
+verify its SHA256 against `checksums.txt`, drain in-flight commands, then swap the binary
+and restart the service. **Windows does the swap in-process** (`updater/swap.go`: rename
+the running exe to `exe.old`, move the verified new file to `exe`, exit, let the SCM
+failure/restart policy relaunch it) with **no helper script**. Linux/macOS still hand
+off to a detached bash script that swaps the binary and restarts the service.
+
+**Windows swap 
 
 **The subtle, previously-production-breaking gotcha — read this before touching
 `updater/*.go`:** `install.ps1` configures Windows SCM restart-on-failure
@@ -495,15 +504,17 @@ reopens this bug:
    update cycle entirely instead of racing the first. This is the guarantee that
    holds *even if* the platform-specific mitigation below is ever imperfect on some
    OS/supervisor version.
-2. **`updater/apply_windows.go` / `apply_other.go`** — before the terminal
-   `os.Exit(0)`, `apply()` makes the *supervisor itself* the cause of this
-   process's exit, instead of just exiting and hoping the supervisor doesn't
-   notice:
-   - **Windows**: runs `sc.exe stop VectrifyRunner`. That delivers a real Stop
-     control request back to *this same process's* own `service_windows.go`
-     `Execute()` dispatch loop, which already correctly reports `StopPending` to
-     the SCM before exiting — so the SCM sees an acknowledged stop, not a crash,
-     and the failure/restart policy never fires.
+2. **`updater/apply_other.go` / `apply_windows.go`** — the platform-specific exit sequence. On Linux/macOS,
+   before the terminal `os.Exit(0)`, `apply()` makes the *supervisor itself* the cause of this
+   process's exit, instead of just exiting and hoping the supervisor doesn't notice:
+   - **Windows** (different mechanism, no helper script): the binary is already swapped
+     in-process (`swap.go`) *before* the exit, so `apply()` exits non-cleanly (`os.Exit(1)`,
+     no `SERVICE_STOPPED` reported) and the SCM's `sc.exe failure ... restart` policy
+     relaunches the service from `exePath` = the new binary. The old `sc.exe stop` trick
+     is gone: it existed to make the old binary's exit look requested so it would not be
+     restarted *before* the script swapped it; with the swap done first, a restart is exactly
+     what we want. `Runner.Shutdown` (browser cleanup) is passed in as `beforeExit`
+     because the SCM Stop handler that used to run it no longer fires.
    - **Linux (systemd)**: runs `systemctl stop vectrify-runner`. Per
      `systemd.service(5)`: *"When the death of the process is a result of systemd
      operation (e.g. service stop or restart), the service will not be
@@ -518,10 +529,7 @@ reopens this bug:
      (removes the job from supervision entirely) instead of `stop`. `apply_other.go`
      branches on `runtime.GOOS` for exactly this reason — don't unify the Linux and
      macOS paths, they need genuinely different supervisor calls.
-   - Each swap script also does its own bounded poll-then-force-stop as an
-     idempotent safety net, and `apply()` sleeps a bounded fallback window
-     (`scmStopFallback` / `supervisorStopFallback`) before falling back to a
-     direct `os.Exit` if the supervisor-triggered stop somehow didn't land — `apply()`
++— `apply()`
      must never hang indefinitely either.
 
 Also note: the temp download path is unique per attempt
