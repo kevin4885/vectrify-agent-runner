@@ -121,6 +121,8 @@ Config is written by the installer. To change a setting, edit the file and resta
 | `max_browser_sessions` | | `3` | Maximum concurrent browser sessions (each holds one Chromium context + page open) |
 | `browser_idle_timeout_seconds` | | `300` | Auto-close a browser session after this many seconds of inactivity |
 | `browser_headless` | | `true` | Set `false` to run browsers headed (visible window) — only useful for local debugging on a machine with a display |
+| `max_background_processes` | | `5` | Maximum concurrent detached background processes (started via `runner_process`, e.g. a dev server) |
+| `background_process_max_age_seconds` | | `3600` | Auto-stop/clean-up a background process (running or already exited) after this many seconds, if never explicitly stopped or retrieved |
 
 ### Command-line flags
 

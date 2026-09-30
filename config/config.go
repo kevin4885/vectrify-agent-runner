@@ -86,6 +86,38 @@ const (
 	// maxSaneBrowserIdleTimeoutSeconds bounds browser_idle_timeout_seconds;
 	// same self-correction rationale as the other maxSane* constants.
 	maxSaneBrowserIdleTimeoutSeconds = 3600
+
+	// defaultMaxBackgroundProcesses is the default size of the background
+	// process pool (see ProcessManager in executor/process.go). Small for
+	// the same reason as defaultMaxBrowserSessions — a customer machine is
+	// not expected to run many concurrent agent-started dev servers/long-
+	// lived commands at once.
+	defaultMaxBackgroundProcesses = 5
+
+	// maxSaneBackgroundProcesses is a sanity ceiling on
+	// max_background_processes, clamped (with a warning) rather than
+	// honored verbatim, same rationale as maxSaneBrowserSessions.
+	maxSaneBackgroundProcesses = 20
+
+	// defaultBackgroundProcessMaxAgeSeconds is how long a background
+	// process (or an exited-but-never-retrieved entry for one) may exist
+	// before the reaper force-stops/cleans it up. Deliberately much longer
+	// than defaultBrowserIdleTimeoutSeconds: a background process is
+	// typically something like a dev server meant to stay up for an
+	// entire multi-step agent workflow (start it, drive it with several
+	// browser actions spread over minutes, then stop it explicitly) —
+	// this is a safety net against a genuinely forgotten process, not a
+	// tight idle timeout. Exists so a forgotten `start` (no matching
+	// `stop`) does not hold a real OS process open forever.
+	defaultBackgroundProcessMaxAgeSeconds = 3600
+
+	// maxSaneBackgroundProcessMaxAgeSeconds bounds
+	// background_process_max_age_seconds; same self-correction rationale
+	// as the other maxSane* constants. 24h comfortably covers any
+	// legitimate long-running dev-server-driving workflow while still
+	// self-correcting an obviously wrong value (e.g. a typo'd extra zero)
+	// instead of letting a background process run essentially forever.
+	maxSaneBackgroundProcessMaxAgeSeconds = 86400
 )
 
 // Config holds all runner settings loaded from config.yaml.
@@ -158,6 +190,17 @@ type Config struct {
 	// (no visible window) or headed. Defaults to true. Set false only for
 	// local debugging on a machine with a display.
 	BrowserHeadless *bool `yaml:"browser_headless"`
+
+	// MaxBackgroundProcesses caps how many long-lived, detached background
+	// processes (see executor/process.go's ProcessManager — the "process"
+	// command type: start/stop/list/logs) may be tracked at the same time.
+	// Defaults to 5.
+	MaxBackgroundProcesses int `yaml:"max_background_processes"`
+
+	// BackgroundProcessMaxAgeSeconds is how long a background process (or
+	// an exited-but-never-retrieved entry for one) may exist before the
+	// reaper force-stops/cleans it up. Defaults to 3600 (1 hour).
+	BackgroundProcessMaxAgeSeconds int `yaml:"background_process_max_age_seconds"`
 
 	// ConfigPath is the absolute path this config was loaded from. Not part of
 	// the YAML file itself (yaml:"-") — set by Load() so the running process
@@ -367,6 +410,26 @@ func (c *Config) applyDefaults() {
 	if c.BrowserHeadless == nil {
 		defaultHeadless := true
 		c.BrowserHeadless = &defaultHeadless
+	}
+
+	if c.MaxBackgroundProcesses <= 0 {
+		c.MaxBackgroundProcesses = defaultMaxBackgroundProcesses
+	} else if c.MaxBackgroundProcesses > maxSaneBackgroundProcesses {
+		c.Warnings = append(c.Warnings, fmt.Sprintf(
+			"max_background_processes (%d) exceeds the sanity ceiling of %d; clamping max_background_processes to %d",
+			c.MaxBackgroundProcesses, maxSaneBackgroundProcesses, maxSaneBackgroundProcesses,
+		))
+		c.MaxBackgroundProcesses = maxSaneBackgroundProcesses
+	}
+
+	if c.BackgroundProcessMaxAgeSeconds <= 0 {
+		c.BackgroundProcessMaxAgeSeconds = defaultBackgroundProcessMaxAgeSeconds
+	} else if c.BackgroundProcessMaxAgeSeconds > maxSaneBackgroundProcessMaxAgeSeconds {
+		c.Warnings = append(c.Warnings, fmt.Sprintf(
+			"background_process_max_age_seconds (%d) exceeds the sanity ceiling of %d; clamping background_process_max_age_seconds to %d",
+			c.BackgroundProcessMaxAgeSeconds, maxSaneBackgroundProcessMaxAgeSeconds, maxSaneBackgroundProcessMaxAgeSeconds,
+		))
+		c.BackgroundProcessMaxAgeSeconds = maxSaneBackgroundProcessMaxAgeSeconds
 	}
 }
 

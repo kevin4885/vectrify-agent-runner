@@ -25,6 +25,7 @@ type Runner struct {
 	fileOps       *executor.FileOps
 	shell         *executor.Shell
 	browser       *executor.BrowserManager
+	process       *executor.ProcessManager
 	workspaceRoot string
 	cfg           *config.Config
 	log           *slog.Logger
@@ -42,19 +43,26 @@ func New(cfg *config.Config, log *slog.Logger) *Runner {
 			cfg.IsBrowserHeadless(),
 			log,
 		),
+		process: executor.NewProcessManager(
+			cfg.WorkspaceRoot,
+			cfg.MaxBackgroundProcesses,
+			time.Duration(cfg.BackgroundProcessMaxAgeSeconds)*time.Second,
+			log,
+		),
 		workspaceRoot: cfg.WorkspaceRoot,
 		cfg:           cfg,
 		log:           log,
 	}
 }
 
-// Shutdown releases resources held by the Runner's executors — currently
-// just the browser manager's Chromium process + driver, if it was ever
-// started. Safe to call even if no browser command was ever dispatched
-// (BrowserManager.Shutdown no-ops in that case). Called from main.go on
-// graceful shutdown.
+// Shutdown releases resources held by the Runner's executors — the browser
+// manager's Chromium process + driver (if it was ever started) and every
+// tracked background process. Safe to call even if neither feature was
+// ever used (both managers' Shutdown no-op in that case). Called from
+// main.go on graceful shutdown.
 func (r *Runner) Shutdown() {
 	r.browser.Shutdown()
+	r.process.Shutdown()
 }
 
 // Dispatch processes one inbound command and calls send for each outbound message.
@@ -82,6 +90,8 @@ func (r *Runner) Dispatch(raw protocol.RawCommand, send func(interface{}), trigg
 		r.handleUpdateKey(cmdID, raw, send, triggerReconnect)
 	case "browser":
 		r.handleBrowser(cmdID, raw, send)
+	case "process":
+		r.handleProcess(cmdID, raw, send)
 	default:
 		send(protocol.ErrorMsg{
 			CmdID:   cmdID,
@@ -417,6 +427,91 @@ func (r *Runner) handleBrowser(cmdID string, raw protocol.RawCommand, send func(
 		}
 	}
 	send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: true, Data: data})
+}
+
+// ── Background process ──────────────────────────────────────────────────────
+
+// handleProcess dispatches one "process" command to the shared
+// ProcessManager. Gated by cfg.AllowShell — same reasoning as browser
+// commands (see handleBrowser): this is an extension of shell-level trust,
+// not its own permission.
+func (r *Runner) handleProcess(cmdID string, raw protocol.RawCommand, send func(interface{})) {
+	if !r.cfg.AllowShell {
+		send(protocol.ResultMsg{
+			CmdID: cmdID, Type: "result", OK: false,
+			Error: "process commands require allow_shell=true in config.yaml (background processes share the shell permission — there is no separate allow_process setting)",
+		})
+		return
+	}
+
+	action, _ := raw["action"].(string)
+	processID, _ := raw["process_id"].(string)
+
+	var data string
+	var err error
+
+	switch action {
+	case "start":
+		command, _ := raw["command"].(string)
+		workingDir, _ := raw["working_dir"].(string)
+		var info executor.ProcessInfo
+		info, err = r.process.Start(processID, command, workingDir)
+		if err == nil {
+			data = formatProcessInfo(info)
+		}
+
+	case "stop":
+		if r.process.Stop(processID) {
+			data = fmt.Sprintf("process %q stopped", processID)
+		} else {
+			data = fmt.Sprintf("process %q was not running (already stopped or never existed)", processID)
+		}
+
+	case "list":
+		infos := r.process.List()
+		if len(infos) == 0 {
+			data = "no background processes are currently tracked"
+		} else {
+			var sb strings.Builder
+			for _, info := range infos {
+				sb.WriteString(formatProcessInfo(info))
+				sb.WriteString("\n")
+			}
+			data = strings.TrimRight(sb.String(), "\n")
+		}
+
+	case "logs":
+		tailLines := protocol.Int(raw["tail_lines"])
+		data, err = r.process.Logs(processID, tailLines)
+
+	default:
+		send(protocol.ResultMsg{
+			CmdID: cmdID, Type: "result", OK: false,
+			Error: fmt.Sprintf("unknown process action: %q", action),
+		})
+		return
+	}
+
+	if err != nil {
+		send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: false, Error: err.Error()})
+		return
+	}
+	send(protocol.ResultMsg{CmdID: cmdID, Type: "result", OK: true, Data: data})
+}
+
+// formatProcessInfo renders one ProcessInfo as a human-readable line,
+// shared by the "start" and "list" actions so their output is consistent.
+func formatProcessInfo(info executor.ProcessInfo) string {
+	if info.Running {
+		return fmt.Sprintf("process_id=%s pid=%d running command=%q working_dir=%q started_at=%s",
+			info.ID, info.PID, info.Command, info.WorkingDir, info.StartedAt.Format(time.RFC3339))
+	}
+	detail := info.ExitError
+	if detail == "" {
+		detail = fmt.Sprintf("exit code %d", info.ExitCode)
+	}
+	return fmt.Sprintf("process_id=%s pid=%d exited (%s) command=%q working_dir=%q started_at=%s",
+		info.ID, info.PID, detail, info.Command, info.WorkingDir, info.StartedAt.Format(time.RFC3339))
 }
 
 // DecodeRaw decodes a raw JSON WebSocket message into a RawCommand.
