@@ -29,13 +29,34 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p dist
+          # Windows: NO "-s -w". Stripping symbols from an unsigned Go exe makes
+          # it look opaque to Microsoft Defender's ML classifier
+          # (Trojan:Win32/Bearfoos.A!ml false positive). Other OSes stay stripped.
+          # -trimpath removes the CI runner's absolute paths from every binary.
+          LDFLAGS_WIN="-X vectrify/agent-runner/config.Version=${VERSION}"
           LDFLAGS="-s -w -X vectrify/agent-runner/config.Version=${VERSION}"
 
-          GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/vectrify-runner-windows-amd64.exe .
-          GOOS=linux   GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/vectrify-runner-linux-amd64 .
-          GOOS=linux   GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/vectrify-runner-linux-arm64 .
-          GOOS=darwin  GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/vectrify-runner-darwin-amd64 .
-          GOOS=darwin  GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/vectrify-runner-darwin-arm64 .
+          # Windows version-info + manifest resource. The _windows_amd64 suffix
+          # on the .syso means only the Windows build links it.
+          IFS=. read -r VMAJ VMIN VPAT _ <<< "${VERSION%%[-+]*}"
+          VMAJ=${VMAJ:-0}; VMIN=${VMIN:-0}; VPAT=${VPAT:-0}
+          # A non-numeric tag (e.g. "vtest") must not fail the release build.
+          [[ $VMAJ =~ ^[0-9]+$ ]] || VMAJ=0
+          [[ $VMIN =~ ^[0-9]+$ ]] || VMIN=0
+          [[ $VPAT =~ ^[0-9]+$ ]] || VPAT=0
+          VFULL="${VMAJ}.${VMIN}.${VPAT}.0"
+          go run github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.4.1 -64 \
+            -o resource_windows_amd64.syso \
+            -file-version "$VFULL" -product-version "$VFULL" \
+            -ver-major "$VMAJ" -ver-minor "$VMIN" -ver-patch "$VPAT" -ver-build 0 \
+            -product-ver-major "$VMAJ" -product-ver-minor "$VMIN" -product-ver-patch "$VPAT" -product-ver-build 0 \
+            winres/versioninfo.json
+
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS_WIN" -o dist/vectrify-runner-windows-amd64.exe .
+          GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/vectrify-runner-linux-amd64 .
+          GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/vectrify-runner-linux-arm64 .
+          GOOS=darwin  GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/vectrify-runner-darwin-amd64 .
+          GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/vectrify-runner-darwin-arm64 .
 
       - name: Generate checksums
         # Required by updater/apply_windows.go and apply_other.go: the

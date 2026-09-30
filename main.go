@@ -109,7 +109,7 @@ func main() {
 // runInteractive runs the client with OS signal handling for graceful shutdown.
 // Used on all platforms when running directly in a terminal (not as a service daemon).
 func runInteractive(log *slog.Logger, c *client.Client, r *runner.Runner) {
-	updater.Start(config.Version, log, c.Drain)
+	updater.Start(config.Version, log, c.Drain, r.Shutdown)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {

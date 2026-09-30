@@ -6,8 +6,11 @@
 //   2. Downloads the SHA256 manifest and verifies the download before touching
 //      the running binary.  The update is aborted if the checksum does not match.
 //   3. Calls drain() to let in-flight commands finish (up to drainTimeout).
-//   4. Writes a tiny update script, spawns it detached, and exits cleanly.
-//      The script stops the service, swaps the binary, and restarts.
+//   4. Windows: renames the running exe aside and moves the new one into
+//      place in-process (swap.go), then exits so the SCM failure/restart
+//      policy relaunches the service on the new binary. No helper script.
+//      Linux/macOS: writes a tiny shell script, spawns it detached, and exits;
+//      the script stops the service, swaps the binary, and restarts.
 //
 // Disabled automatically for dev builds (version == "dev").
 package updater
@@ -50,9 +53,12 @@ type githubAsset struct {
 // Start launches the background auto-update loop.
 // drain is called with drainTimeout before the process exits to let in-flight
 // commands finish.  Pass nil to skip draining (e.g. in tests).
+// beforeExit is called (if non-nil) right before the process exits to finish
+// an update, for cleanup the OS would otherwise get from a service stop
+// (e.g. closing the Playwright browser).
 // Returns immediately; the check runs in a goroutine.
 // Does nothing for dev builds (version == "dev").
-func Start(currentVersion string, log *slog.Logger, drain func(time.Duration)) {
+func Start(currentVersion string, log *slog.Logger, drain func(time.Duration), beforeExit func()) {
 	if currentVersion == "dev" {
 		log.Debug("auto-update: disabled in dev build")
 		return
@@ -66,16 +72,21 @@ func Start(currentVersion string, log *slog.Logger, drain func(time.Duration)) {
 				)
 			}
 		}()
-		checkAndApply(currentVersion, log, drain)
+		// Best-effort: remove the previous binary / legacy script an earlier
+		// update left behind (see swap.go).
+		if exePath, err := os.Executable(); err == nil {
+			removeLeftovers(exePath)
+		}
+		checkAndApply(currentVersion, log, drain, beforeExit)
 		ticker := time.NewTicker(checkInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			checkAndApply(currentVersion, log, drain)
+			checkAndApply(currentVersion, log, drain, beforeExit)
 		}
 	}()
 }
 
-func checkAndApply(currentVersion string, log *slog.Logger, drain func(time.Duration)) {
+func checkAndApply(currentVersion string, log *slog.Logger, drain func(time.Duration), beforeExit func()) {
 	rel, err := fetchLatestRelease()
 	if err != nil {
 		log.Warn("auto-update: version check failed", "err", err)
@@ -119,7 +130,7 @@ func checkAndApply(currentVersion string, log *slog.Logger, drain func(time.Dura
 	//     (see apply_windows.go / apply_other.go) — not by any Go code,
 	//     since the process is gone by then.
 	log.Info("auto-update: new version available", "current", currentVersion, "latest", latest)
-	if err := apply(exePath, latest, rel.Assets, log, drain, lock); err != nil {
+	if err := apply(exePath, latest, rel.Assets, log, drain, beforeExit, lock); err != nil {
 		log.Error("auto-update: failed", "err", err)
 		lock.release()
 	}

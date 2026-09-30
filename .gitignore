@@ -28,3 +28,6 @@ go.work.sum
 
 /dist/
 dev-config.yaml
+
+# Generated Windows version-info resource (see build.ps1 / release.yml)
+*.syso

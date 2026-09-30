@@ -17,7 +17,7 @@ import (
 // the normal path — see the comment at the call site.
 const supervisorStopFallback = 10 * time.Second
 
-func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drain func(time.Duration), lock *updateLock) error {
+func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drain func(time.Duration), _ func(), lock *updateLock) error {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
 	assetName := fmt.Sprintf("vectrify-runner-%s-%s", goos, goarch)
