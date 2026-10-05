@@ -41,7 +41,7 @@ The installer will ask for:
 - **Windows only: which account to run the service as** — defaults to whoever is running the installer; you can type a different local account name instead. You'll also be prompted for that account's password (needed to register the service to run as it — see "Windows service account" in CLAUDE.md).
 - **Workspace root folder** — the directory agents are allowed to work in (all file operations are confined here)
 - **Runner key** — the `vrun_...` key from Step 1
-- **Allow shell commands** — whether to permit `runner_shell` commands (default: no)
+- **Allow shell commands** — whether to permit `runner_shell` commands (default: yes)
 - **If shell is enabled: pre-install browser automation now?** — optional; downloads ~300 MB of Chromium immediately instead of on the first browser command later (default: no)
 
 It then installs the binary, writes the config, and registers and starts a system service automatically — on Linux/macOS running as the user who ran the installer (not root); on Windows running as the account you chose above (not `LocalSystem`).
@@ -111,7 +111,7 @@ Config is written by the installer. To change a setting, edit the file and resta
 | `api_url` | ✓ | — | WebSocket URL, e.g. `wss://api.vectrify.ai/api/v1/runner/ws` |
 | `runner_key` | ✓ | — | The `vrun_...` key from the Vectrify UI |
 | `workspace_root` | ✓ | — | Absolute path — all file operations must stay inside this directory |
-| `allow_shell` | | `false` | Set `true` to enable shell commands (bash on Linux/macOS, PowerShell on Windows) |
+| `allow_shell` | | `true` | Shell commands are enabled by default; set `false` to disable them (bash on Linux/macOS, PowerShell on Windows) |
 | `log_level` | | `info` | Verbosity: `debug` \| `info` \| `warn` \| `error` |
 | `reconnect_max_backoff` | | `60` | Maximum seconds between reconnect attempts (exponential backoff) |
 | `log_file` | | *(auto on Windows service)* | Path to write logs. Set automatically on Windows; on Linux/macOS the service manager captures stdout. |
@@ -284,7 +284,7 @@ The log file is created on first run. If it never appears, the service failed to
 | Guarantee | How |
 |---|---|
 | **Path containment** | Every file path is resolved to absolute, then checked against `workspace_root` before any I/O. Rejects `../` traversal. |
-| **Shell gating** | Shell execution is blocked unless `allow_shell: true` in config. The API also enforces this independently. |
+| **Shell gating** | Shell execution is enabled by default; set `allow_shell: false` in config to block it. The API also enforces this independently. |
 | **Browser gating** | Browser automation is blocked unless `allow_shell: true` in config — there is no separate `allow_browser` setting; browser commands share the shell permission. Screenshot *writes* are subject to the same path containment rule as file operations; `goto` only accepts `http`/`https` URLs. Browser *reads* (via an allowed http/https URL) are bounded by `allow_shell` trust, not `workspace_root` — same as anything reachable via shell. |
 | **Outbound only** | The runner makes one outbound WebSocket connection. No ports are listened on. |
 | **Run as regular user** | The service runs as the account you choose during install (defaults to whoever runs the installer) on Windows, and as the installing user on Linux/macOS — never `LocalSystem`/root, and never a privileged superuser beyond what the installer itself requires. See "Windows service account" in CLAUDE.md for how this is configured and its password-rotation caveat. |

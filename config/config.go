@@ -134,7 +134,9 @@ type Config struct {
 	WorkspaceRoot string `yaml:"workspace_root"`
 
 	// AllowShell enables unrestricted shell command execution.
-	// When false, runner_shell calls are rejected with a clear error.
+	// Defaults to true when the key is absent (see Load); set
+	// allow_shell: false to opt out. When false, runner_shell calls are
+	// rejected with a clear error.
 	AllowShell bool `yaml:"allow_shell"`
 
 	// LogLevel controls verbosity: "debug" | "info" | "warn" | "error".
@@ -225,7 +227,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("reading config file %q: %w", path, err)
 	}
 
-	var cfg Config
+	// allow_shell defaults to true: seed it before unmarshalling so an absent
+	// key stays true while an explicit allow_shell: false still disables it.
+	cfg := Config{AllowShell: true}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config file %q: %w", path, err)
 	}

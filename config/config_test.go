@@ -475,3 +475,35 @@ func TestLoad_ZeroOrNegativeBrowserTunables_FallBackToDefaults(t *testing.T) {
 		})
 	}
 }
+
+// allow_shell defaults to true when the key is absent; an explicit value
+// (true or false) always wins so existing installs can still opt out.
+func TestLoad_AllowShell_DefaultsTrueWhenAbsent(t *testing.T) {
+	cfg, err := Load(writeTestConfig(t, minimalValidConfig))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.AllowShell {
+		t.Error("AllowShell = false, want true when allow_shell is absent")
+	}
+}
+
+func TestLoad_AllowShell_ExplicitFalseHonored(t *testing.T) {
+	cfg, err := Load(writeTestConfig(t, minimalValidConfig+"allow_shell: false\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AllowShell {
+		t.Error("AllowShell = true, want false for explicit allow_shell: false")
+	}
+}
+
+func TestLoad_AllowShell_ExplicitTrueHonored(t *testing.T) {
+	cfg, err := Load(writeTestConfig(t, minimalValidConfig+"allow_shell: true\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.AllowShell {
+		t.Error("AllowShell = false, want true for explicit allow_shell: true")
+	}
+}

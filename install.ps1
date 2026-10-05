@@ -281,7 +281,7 @@ public class VectrifyLsaHelper {
         if ($runnerKey -match '^vrun_.+') { break }
         Write-Host "  Must start with vrun_" -ForegroundColor Yellow
     }
-    $allowShell = Ask-YesNo  "Allow shell commands?" $false
+    $allowShell = Ask-YesNo  "Allow shell commands?" $true
     $preInstallBrowsers = $false
     if ($allowShell) {
         $preInstallBrowsers = Ask-YesNo "  Also pre-install browser automation now? (downloads ~300MB Chromium; optional -- it auto-installs on first use otherwise)" $false

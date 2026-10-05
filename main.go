@@ -56,7 +56,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  api_url:        wss://api.vectrify.ai/api/v1/runner/ws\n")
 		fmt.Fprintf(os.Stderr, "  runner_key:     vrun_...\n")
 		fmt.Fprintf(os.Stderr, "  workspace_root: /home/user/projects\n")
-		fmt.Fprintf(os.Stderr, "  allow_shell:    false\n")
+		fmt.Fprintf(os.Stderr, "  allow_shell:    true\n")
 		os.Exit(1)
 	}
 

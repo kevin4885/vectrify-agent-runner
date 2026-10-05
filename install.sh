@@ -323,7 +323,7 @@ while true; do
 done
 
 # allow_shell
-ALLOW_SHELL="$(read_yesno "Allow shell commands?" "n")"
+ALLOW_SHELL="$(read_yesno "Allow shell commands?" "y")"
 
 # browser automation pre-install (optional -- auto-installs on first use otherwise)
 PRE_INSTALL_BROWSERS="false"

@@ -221,7 +221,7 @@ Default location: `~/.vectrify-runner/config.yaml`
 api_url:              wss://api.vectrify.ai/api/v1/runner/ws
 runner_key:           vrun_...          # from the Vectrify UI (shown once at creation)
 workspace_root:       /home/user/projects  # all file ops must be inside this path
-allow_shell:          false             # set true to enable runner_shell commands
+allow_shell:          true              # default true; set false to disable runner_shell commands
 log_level:            info              # debug | info | warn | error
 reconnect_max_backoff: 60               # seconds
 max_concurrency:       32               # max simultaneous dispatched commands, all classes
@@ -251,7 +251,8 @@ config.yaml with none of these keys set behaves identically. The
 `max_browser_sessions`/`browser_idle_timeout_seconds`/`browser_headless` and
 `max_background_processes`/`background_process_max_age_seconds` keys are
 likewise all optional — an existing config.yaml with none of them set uses
-the defaults shown above and behaves identically. There is no
+the defaults shown above and behaves identically. **`allow_shell` defaults to `true`** when the key is absent (`Load` seeds `Config{AllowShell: true}` before unmarshalling); an explicit `allow_shell: false` opts out. The installers' prompt also defaults to yes.
+There is no
 `allow_browser` or `allow_process` key: both command types are gated by
 `allow_shell` (see "Browser automation" and "Background processes" below).
 
