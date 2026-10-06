@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -144,16 +143,13 @@ func (s *Shell) Run(
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	var c *exec.Cmd
-	if runtime.GOOS == "windows" {
-		// Force UTF-8 I/O so file content with Unicode characters (em-dashes,
-		// ellipses, etc.) is not mangled by PowerShell's default system code page.
-		const utf8Preamble = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " +
-			"$OutputEncoding = [System.Text.Encoding]::UTF8; "
-		c = exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", utf8Preamble+cmd)
-	} else {
-		c = exec.CommandContext(ctx, "bash", "-c", cmd)
-	}
+	// shellInvocation (shell_launch.go) is the single place that turns the
+	// command string into a process invocation — on Windows it stages the
+	// command in a temp file so no quoting layer can mangle it. cleanup
+	// removes that file if the bootstrap never got to consume it.
+	shellName, shellArgs, cleanupCmdFile := shellInvocation(cmd)
+	defer cleanupCmdFile()
+	c := exec.CommandContext(ctx, shellName, shellArgs...)
 	c.Dir = workingDir
 
 	// Defence-in-depth backstop for the process itself: if ctx is done and

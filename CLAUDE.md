@@ -52,6 +52,8 @@ vectrify-agent-runner/
 │   ├── file_ops.go        File CRUD — read (with line numbers), write, str_replace, insert, delete
 │   ├── file_transfer.go   File transfer via presigned S3 URLs (download runner←S3, upload runner→S3)
 │   ├── shell.go           Shell execution (bash/PowerShell) + structured git operations
+│   ├── shell_launch.go    Single launcher for shell.go AND process.go: bash -c, or (Windows) a constant
+│   │                      PowerShell bootstrap that reads the command from a temp file — see "Shell launch" below
 │   └── browser.go         Playwright-driven browser automation (opt-in, see "Browser automation" below)
 ├── updater/
 │   ├── updater.go         Background auto-update loop: checks GitHub releases hourly, downloads +
@@ -393,6 +395,33 @@ for how this is described to the LLM.
   `logs` action.
 
 ---
+
+## Shell launch (`executor/shell_launch.go`) — read before touching how commands start
+
+`Shell.Run` (runner_shell) and `ProcessManager.Start` (runner_process) both call
+`shellInvocation(command)`; never build a `powershell`/`bash` `exec.Cmd` anywhere else.
+
+- **Unix:** `bash -c <command>`, unchanged.
+- **Windows:** the command is written verbatim (UTF-8, no BOM) to
+  `%TEMP%\vectrify-runner-scripts\cmd-*.txt`; powershell is started with a constant
+  `-Command` bootstrap that contains **no double quotes**, reads the file, deletes it, and
+  dot-sources the text. The user's text therefore never goes through Go argv escaping or
+  PowerShell's command-line re-parse (which mangled quote/backslash sequences), and there
+  is no command-line length limit. If the file cannot be written it falls back to passing
+  the command inline (old behaviour). Leftover files (powershell killed before reading)
+  are swept after 1 h.
+- **Why not `-EncodedCommand` / `-File`** (both were tried): `-EncodedCommand` leaks
+  `#< CLIXML` blobs onto stderr in PS 5.1 and is capped near 16k chars; `-File` changes
+  exit-code semantics (a failing last statement stops giving exit 1). The bootstrap
+  appends `;$global:__vecOk = $?` to the script and exits 1 if it is false, which
+  reproduces `-Command` semantics exactly (covered by `TestShellRun_Windows_ExitCodeSemantics`).
+- **Preamble also:** forces UTF-8 console I/O; defaults `Get-Content` / `Select-String` to
+  `-Encoding UTF8` (BOM-less files no longer turn em dashes into mojibake; an explicit
+  `-Encoding` still wins; write-side defaults are deliberately untouched because PS 5.1
+  `UTF8` writes a BOM); and replaces `Set-/Push-/Pop-Location` with `ProxyCommand`-generated
+  proxies that also set `[Environment]::CurrentDirectory`, so relative `[IO.File]::*` paths
+  follow `cd`.
+- Windows PowerShell 5.1 only. If `pwsh` support is ever added, re-verify the bootstrap.
 
 ## Building
 

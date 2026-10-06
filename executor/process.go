@@ -36,7 +36,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -203,14 +202,11 @@ func (m *ProcessManager) Start(id, command, workingDir string) (ProcessInfo, err
 		return ProcessInfo{}, fmt.Errorf("creating log file: %w", err)
 	}
 
-	var c *exec.Cmd
-	if runtime.GOOS == "windows" {
-		const utf8Preamble = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " +
-			"$OutputEncoding = [System.Text.Encoding]::UTF8; "
-		c = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", utf8Preamble+command)
-	} else {
-		c = exec.Command("bash", "-c", command)
-	}
+	// Same launcher as Shell.Run (see shell_launch.go). cleanupCmdFile is
+	// only called on a failed Start: once the process is running its
+	// bootstrap deletes the command file itself, and leftovers are swept.
+	shellName, shellArgs, cleanupCmdFile := shellInvocation(command)
+	c := exec.Command(shellName, shellArgs...)
 	c.Dir = workingDir
 	c.Stdout = logFile
 	c.Stderr = logFile
@@ -229,6 +225,7 @@ func (m *ProcessManager) Start(id, command, workingDir string) (ProcessInfo, err
 	}
 
 	if err := c.Start(); err != nil {
+		cleanupCmdFile()
 		logFile.Close()
 		os.Remove(logPath)
 		return ProcessInfo{}, fmt.Errorf("starting process: %w", err)
