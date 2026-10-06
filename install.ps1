@@ -18,6 +18,34 @@ param(
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Crash-recovery policy the auto-updater depends on: on Windows the updater swaps
+# the binary and then exits non-cleanly so the SCM restarts the service on the new
+# version. If the policy is missing or "take no action" the service stays DOWN
+# after every update (this happened: ~11h outage). So set it, then READ IT BACK
+# and fail loudly - never trust a silent sc.exe.
+function Set-RunnerRestartPolicy([string]$Name) {
+    sc.exe failure $Name reset= 3600 actions= restart/5000/restart/10000/restart/30000 | Out-Null
+    $setExit = $LASTEXITCODE
+    # Verify from the registry, not sc.exe text: locale-independent. Layout of
+    # FailureActions: 20-byte header (ResetPeriod, RebootMsg, Command,
+    # ActionsCount, ActionsOffset), then ActionsCount x (Type, DelayMs) pairs.
+    # Type 1 = restart, 0 = none.
+    $raw = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name FailureActions -EA SilentlyContinue).FailureActions
+    $ok = $false
+    if ($raw -and $raw.Length -ge 28) {
+        $count = [BitConverter]::ToUInt32($raw, 12)
+        if ($count -ge 1 -and $raw.Length -ge (20 + 8 * $count)) {
+            $ok = $true
+            for ($i = 0; $i -lt $count; $i++) {
+                if ([BitConverter]::ToUInt32($raw, 20 + 8 * $i) -ne 1) { $ok = $false }
+            }
+        }
+    }
+    if (-not $ok) {
+        throw "Could not configure restart-on-failure for service $Name (sc.exe exit $setExit). Without it, auto-update leaves the runner stopped. Run:  sc.exe failure $Name reset= 3600 actions= restart/5000/restart/10000/restart/30000"
+    }
+}
+
 function Install-VectrifyRunner {
 
     $GITHUB_REPO    = "kevin4885/vectrify-agent-runner"
@@ -109,6 +137,15 @@ function Install-VectrifyRunner {
         }
         New-Item -ItemType Directory -Force $InstallDir | Out-Null
         Copy-Item -Force $src $ExeDest
+        # Repair the crash-recovery policy too: this path used to leave it
+        # untouched, so a service installed with a broken policy stayed broken
+        # through every reinstall.
+        try {
+            Set-RunnerRestartPolicy $ServiceName
+        } catch {
+            Write-Host ""
+            Write-Host "  WARNING: $_" -ForegroundColor Yellow
+        }
         Start-Service $ServiceName
         Write-Host " done" -ForegroundColor Green
         Write-Host ""
@@ -396,7 +433,7 @@ log_file:              $LogFile
     Write-Host " done" -ForegroundColor Green
 
     Write-Host "  [6/6] Restart-on-failure + start..." -NoNewline
-    sc.exe failure $ServiceName reset= 3600 actions= restart/5000/restart/10000/restart/30000 | Out-Null
+    Set-RunnerRestartPolicy $ServiceName
     Start-Service $ServiceName
     Write-Host " done" -ForegroundColor Green
 

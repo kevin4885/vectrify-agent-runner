@@ -38,6 +38,12 @@ const (
 	// before applying an update and exiting.  Keeps updates snappy while still
 	// giving short-running commands a chance to complete.
 	drainTimeout = 30 * time.Second
+
+	// leftoverGrace is how long after startup the previous binary
+	// (exe.old) is kept before the best-effort cleanup removes it. It must
+	// exceed the post-update watchdog's Deadline (4 min) so a rollback
+	// target is never deleted while the watchdog may still need it.
+	leftoverGrace = 6 * time.Minute
 )
 
 type githubRelease struct {
@@ -73,9 +79,14 @@ func Start(currentVersion string, log *slog.Logger, drain func(time.Duration), b
 			}
 		}()
 		// Best-effort: remove the previous binary / legacy script an earlier
-		// update left behind (see swap.go).
+		// update left behind (see swap.go). DELAYED, not immediate: right
+		// after an update, exe.old is the rollback target of the post-update
+		// watchdog (watchdog.go). Deleting it at startup would leave the
+		// watchdog nothing to roll back to. leftoverGrace outlasts the
+		// watchdog's whole budget; the watchdog also deletes it itself the
+		// moment the new version proves healthy.
 		if exePath, err := os.Executable(); err == nil {
-			removeLeftovers(exePath)
+			time.AfterFunc(leftoverGrace, func() { removeLeftovers(exePath) })
 		}
 		checkAndApply(currentVersion, log, drain, beforeExit)
 		ticker := time.NewTicker(checkInterval)
@@ -104,6 +115,16 @@ func checkAndApply(currentVersion string, log *slog.Logger, drain func(time.Dura
 	exePath, err := os.Executable()
 	if err != nil {
 		log.Warn("auto-update: could not resolve own executable path", "err", err)
+		return
+	}
+
+	// A release that was installed, could not stay up, and was rolled back by
+	// the watchdog must not be re-installed - otherwise every hourly check
+	// would re-download the same broken release and crash-loop the runner
+	// again. A newer release (different version string) is still eligible.
+	if isBadVersion(exePath, latest) {
+		log.Warn("auto-update: skipping release that previously failed and was rolled back",
+			"current", currentVersion, "latest", latest)
 		return
 	}
 

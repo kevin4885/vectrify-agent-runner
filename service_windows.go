@@ -1,4 +1,4 @@
-﻿//go:build windows
+//go:build windows
 
 package main
 
@@ -12,6 +12,7 @@ import (
 	"vectrify/agent-runner/config"
 	"vectrify/agent-runner/runner"
 	"vectrify/agent-runner/updater"
+	"vectrify/agent-runner/winsvc"
 )
 
 // winSvc implements svc.Handler so vectrify-runner can be registered and
@@ -27,6 +28,13 @@ type winSvc struct {
 // stop/shutdown control requests.
 func (s *winSvc) Execute(_ []string, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
 	status <- svc.Status{State: svc.StartPending}
+
+	// Verify (and, with the rights, repair) this service's crash-recovery
+	// policy. Auto-update exits non-cleanly and relies on the SCM restarting
+	// us; a policy of "take no action" once left the runner down for ~11 hours
+	// after an update. Runs in the background so a slow SCM can never delay
+	// start-up, and never blocks or fails the service.
+	go s.checkRecoveryPolicy()
 
 	updater.Start(config.Version, s.log, s.client.Drain, s.runner.Shutdown)
 
@@ -46,6 +54,24 @@ func (s *winSvc) Execute(_ []string, r <-chan svc.ChangeRequest, status chan<- s
 		}
 	}
 	return false, 0
+}
+
+// checkRecoveryPolicy makes sure the SCM will restart this service if it dies.
+func (s *winSvc) checkRecoveryPolicy() {
+	defer func() {
+		if p := recover(); p != nil {
+			s.log.Error("recovery policy check panicked", "panic", p)
+		}
+	}()
+	name, err := winsvc.OwnName()
+	if err != nil {
+		s.log.Warn("could not determine own service name; skipping recovery policy check", "err", err)
+		return
+	}
+	if _, err := winsvc.EnsureRestartPolicy(name, s.log); err != nil {
+		s.log.Warn("service recovery policy is not set to restart on crash and could not be repaired; auto-update falls back to its watchdog",
+			"service", name, "err", err)
+	}
 }
 
 // runService detects whether the process was launched by the Windows SCM and

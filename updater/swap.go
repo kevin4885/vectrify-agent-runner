@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // swapBinary replaces the executable at exePath with the already-downloaded,
@@ -70,4 +71,31 @@ func removeLeftovers(exePath string) {
 			_ = os.Remove(m)
 		}
 	}
+	if matches, err := filepath.Glob(exePath + ".bad.*"); err == nil {
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+	}
+}
+
+// restorePrevious undoes swapBinary: it moves the (bad) binary now at exePath
+// aside to a unique "<exe>.bad.<unixnano>" name and puts the previous binary
+// back at exePath. Used by the post-update watchdog when the new version
+// cannot stay up. Like swapBinary it never leaves exePath without a binary:
+// if installing the previous one fails, the bad one is moved back.
+func restorePrevious(exePath, oldPath string) error {
+	if _, err := os.Stat(oldPath); err != nil {
+		return fmt.Errorf("previous binary %s is not available: %w", oldPath, err)
+	}
+	badPath := fmt.Sprintf("%s.bad.%d", exePath, time.Now().UnixNano())
+	if err := os.Rename(exePath, badPath); err != nil {
+		return fmt.Errorf("moving bad binary aside: %w", err)
+	}
+	if err := os.Rename(oldPath, exePath); err != nil {
+		if rbErr := os.Rename(badPath, exePath); rbErr != nil {
+			return fmt.Errorf("restoring previous binary: %v; ROLLBACK ALSO FAILED (bad binary is at %s): %w", err, badPath, rbErr)
+		}
+		return fmt.Errorf("restoring previous binary (undone): %w", err)
+	}
+	return nil
 }

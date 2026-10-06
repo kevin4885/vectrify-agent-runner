@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows/svc"
+
+	"vectrify/agent-runner/winsvc"
 )
 
 func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drain func(time.Duration), beforeExit func(), lock *updateLock) error {
@@ -61,6 +63,35 @@ func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drai
 	}
 	log.Info("auto-update: checksum verified")
 
+	// -- Prove the candidate can actually run on this machine ---------------
+	// A matching checksum does not catch a binary that antivirus mangled or
+	// that is not runnable here. Find out BEFORE touching the working install.
+	if err := smokeTest(tmpPath, version); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("candidate binary failed its smoke test; keeping the current version: %w", err)
+	}
+	log.Info("auto-update: candidate binary smoke test passed")
+
+	// -- Make sure the service WILL come back after we exit -----------------
+	// Layer 1: the SCM crash-recovery policy. Verify it (and repair it when we
+	// have the rights) before relying on it. Layer 2 is the watchdog below.
+	isService, _ := svc.IsWindowsService()
+	serviceName := ""
+	policyOK := false
+	if isService {
+		if name, nerr := winsvc.OwnName(); nerr != nil {
+			log.Warn("auto-update: could not determine own service name", "err", nerr)
+			serviceName = winsvc.DefaultName
+		} else {
+			serviceName = name
+		}
+		if _, perr := winsvc.EnsureRestartPolicy(serviceName, log); perr != nil {
+			log.Warn("auto-update: SCM restart policy is not guaranteed", "err", perr)
+		} else {
+			policyOK = true
+		}
+	}
+
 	// -- Drain in-flight commands before exiting ----------------------------
 	if drain != nil {
 		log.Info("auto-update: draining in-flight commands", "timeout", drainTimeout)
@@ -80,6 +111,25 @@ func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drai
 		return err
 	}
 	log.Info("auto-update: binary swapped", "version", version, "previous", oldPath)
+
+	// Layer 2: a detached watchdog (the NEW binary) that outlives this process,
+	// restarts the service itself if the SCM does not, and rolls back to
+	// oldPath if the new version cannot stay up (see updater/watchdog.go).
+	if isService {
+		if werr := spawnWatchdog(exePath, serviceName, version, oldPath, log); werr != nil {
+			if !policyOK {
+				// Neither safety net exists. Exiting now would leave the
+				// service dead (the exact incident this code prevents), so
+				// undo the swap and stay on the working version.
+				if rbErr := restorePrevious(exePath, oldPath); rbErr != nil {
+					log.Error("auto-update: rollback after watchdog failure also failed", "err", rbErr)
+				}
+				lock.release()
+				return fmt.Errorf("no safe way to restart the service after updating (SCM restart policy unverified and watchdog failed: %v); update abandoned, still on the current version", werr)
+			}
+			log.Warn("auto-update: watchdog could not start; relying on the SCM restart policy alone", "err", werr)
+		}
+	}
 
 	// The swap is complete and exePath now holds the new version, so the
 	// update lock has done its job. Release it now: os.Exit below skips
@@ -111,7 +161,6 @@ func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drai
 	// Consequence: auto-update on Windows depends on the SCM failure/restart
 	// policy that install.ps1 sets. If someone removes it, the service stays
 	// stopped after an update until started manually.
-	isService, _ := svc.IsWindowsService()
 	if isService {
 		log.Info("auto-update: exiting so the SCM restarts the service on the new binary", "version", version)
 		os.Exit(1)

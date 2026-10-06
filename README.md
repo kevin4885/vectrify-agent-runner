@@ -236,6 +236,9 @@ GitHub Actions builds all 5 binaries and publishes them as a GitHub Release auto
 
 ## Troubleshooting
 
+**Service stayed stopped after an auto-update**
+Check `sc.exe qfailure VectrifyRunner` - it must list `RESTART` actions. If it says nothing (or the actions are `NONE`), the crash-recovery policy is missing. Current versions repair it automatically at start-up when the service account is an administrator and also run a post-update watchdog that restarts the service (and rolls back a release that cannot stay up) even without the policy; re-running the installer also repairs it. Manual fix from an elevated prompt: `sc.exe failure VectrifyRunner reset= 3600 actions= restart/5000/restart/10000/restart/30000`. The log shows `watchdog:` lines for every update hand-over.
+
 **`... is not a valid Win32 application` in Event Viewer after an auto-update, or the service won't start after an update**
 This was a real bug (fixed in versions after v1.0.17): the auto-updater could trigger the Windows service to be treated as "crashed" and auto-restarted mid-update, causing two update flows to corrupt the binary by writing to it at the same time. Versions after the fix prevent this from happening again (see CLAUDE.md's "Auto-update" section for the full mechanism). If you hit this: stop the service, download the latest release binary directly from GitHub Releases, replace `C:\Program Files\VectrifyRunner\vectrify-runner.exe` with it, and start the service again.
 

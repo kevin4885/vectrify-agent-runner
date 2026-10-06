@@ -1,4 +1,4 @@
-﻿// Vectrify Agent Runner
+// Vectrify Agent Runner
 //
 // A lightweight daemon that connects to the Vectrify API over a persistent
 // WebSocket and executes commands on the local machine: file operations,
@@ -32,7 +32,21 @@ import (
 func main() {
 	installBrowsers := flag.Bool("install-browsers", false, "Download the Playwright driver + Chromium browser binaries needed for browser commands, then exit. Optional — the runner auto-installs these on the first browser command if missing, so this flag is only useful to pre-warm the install (avoid the ~300MB download delay on that first command) or to run it ahead of time during provisioning. Browser automation is gated by allow_shell — there is no separate allow_browser setting.")
 	configPath := flag.String("config", "", "Path to config.yaml (default: ~/.vectrify-runner/config.yaml)")
+	showVersion := flag.Bool("version", false, "Print the runner version and exit. Used by the auto-updater to smoke-test a downloaded binary before installing it.")
+	// Post-update watchdog (Windows). Started detached by the updater, never by
+	// a human; see updater/watchdog.go.
+	watchdog := flag.Bool(updater.FlagWatchdog, false, "internal: supervise the service hand-over after an auto-update")
+	wdService := flag.String(updater.FlagWatchdogService, "", "internal: SCM service name to supervise")
+	wdOldPID := flag.Uint(updater.FlagWatchdogOldPID, 0, "internal: PID of the pre-update process")
+	wdVersion := flag.String(updater.FlagWatchdogVersion, "", "internal: version that was just installed")
+	wdPrevious := flag.String(updater.FlagWatchdogPrevious, "", "internal: path of the previous binary (rollback target)")
+	wdTarget := flag.String(updater.FlagWatchdogTarget, "", "internal: path of the installed (new) binary the service runs")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("vectrify-runner %s\n", config.Version)
+		os.Exit(0)
+	}
 
 	if *installBrowsers {
 		fmt.Println("Downloading Playwright driver + Chromium browser binaries (this may take a minute)...")
@@ -92,6 +106,16 @@ func main() {
 	// swallowed just because the runner chose to boot anyway.
 	for _, w := range cfg.Warnings {
 		log.Warn("config warning", "detail", w)
+	}
+
+	if *watchdog {
+		// Supervisor mode: no WebSocket, no updater, no service registration.
+		// Just make sure the service comes back healthy (or roll it back).
+		out := updater.RunWatchdogProcess(*wdService, *wdVersion, *wdPrevious, *wdTarget, uint32(*wdOldPID), log)
+		if out == updater.OutcomeGaveUp {
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
 
 	log.Info("vectrify agent runner starting",

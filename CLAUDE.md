@@ -61,9 +61,18 @@ vectrify-agent-runner/
 │   │                      "Auto-update" below — has a subtle cross-platform gotcha, read before touching)
 │   ├── lock.go            Cross-process update lock (prevents two runner processes on the same
 │   │                      machine from swapping the binary at the same time)
-│   ├── apply_windows.go   Windows: in-process rename swap, no helper script (build tag: windows)
-│   ├── swap.go            Windows swap: rename running exe -> exe.old, move new exe in, roll back on failure
+│   ├── apply_windows.go   Windows: smoke-test candidate, verify SCM policy, in-process rename swap, spawn
+│   │                      watchdog, exit (build tag: windows) — see "Windows update safety nets"
+│   ├── swap.go            Windows swap: rename running exe -> exe.old, move new exe in, roll back on failure;
+│   │                      restorePrevious() = undo a completed swap (used by the watchdog)
+│   ├── safety.go          smokeTest() (run the candidate with -version before installing) + bad-version marker
+│   ├── watchdog.go        Platform-neutral post-update watchdog decision logic (injected clock, fully tested)
+│   ├── watchdog_windows.go  SCM adapter, detached spawn, RunWatchdogProcess entry point
+│   ├── watchdog_env_*.go  Classifies a failed service Start as environment (account/logon) vs binary-broken
 │   └── apply_other.go     Linux/macOS: systemd/launchd-aware swap (build tag: !windows)
+├── winsvc/                Windows SCM helpers (build tag: windows): OwnName() (which service am I),
+│                          Controller (query/start/stop with least-privilege access masks),
+│                          EnsureRestartPolicy() (verify + self-repair crash-recovery policy)
 └── runner/
     └── runner.go          Command dispatch loop — routes cmd_type to executor, formats responses
 ```
@@ -559,8 +568,45 @@ reopens this bug:
      (removes the job from supervision entirely) instead of `stop`. `apply_other.go`
      branches on `runtime.GOOS` for exactly this reason — don't unify the Linux and
      macOS paths, they need genuinely different supervisor calls.
-+— `apply()`
-     must never hang indefinitely either.
+### Windows update safety nets (added after the 1.0.23 outage) — read before touching `apply_windows.go`
+
+**Incident:** after the 1.0.22 and 1.0.23 auto-updates the service stayed **down for ~11 hours**
+until a human restarted it. The updater did everything right (swap, `os.Exit(1)`; Event 7034
+"terminated unexpectedly" proves the SCM saw the crash) but the service's recovery policy was
+**"Take No Action"** on every failure (delays present, every action type `0`; `VectrifyRunner-TS` had
+no policy at all). `install.ps1` set it once, silently (`| Out-Null`), never verified it, and the
+reinstall/update path never touched it. Windows auto-update therefore depended on one unverified
+piece of machine configuration, with no detection and no fallback. It is now layered:
+
+1. **Smoke test** (`safety.go`) — before touching the running binary, execute the verified candidate
+   with `-version`; it must run, exit 0 and report the expected version. A matching checksum does not
+   prove the file runs here (AV mangling, the v1.0.17 "not a valid Win32 application" class).
+2. **Policy self-heal** (`winsvc/recovery_windows.go`) — `EnsureRestartPolicy` runs at every service
+   start (`service_windows.go`, background) and right before an update. It reads the policy, and if any
+   action is not "restart" it rewrites it and **reads it back**. Needs `SERVICE_CHANGE_CONFIG |
+   SERVICE_START` (the SCM rejects storing a restart action without `SERVICE_START`), i.e. a service
+   account that is an administrator; otherwise it logs a WARN and the watchdog covers the update.
+3. **Post-update watchdog** (`watchdog*.go`) — independent of the SCM policy. `apply()` spawns a detached
+   process (`-post-update-watchdog ...`, hidden from `-h` only by the `internal:` help text) just before
+   exiting. It deliberately runs the **previous** binary (known-good, and a running exe can be renamed)
+   not the new one. It waits for the old PID to go, gives the SCM `RestartGrace` (20s, > the 5s first
+   restart delay), then `Start`s the service itself, then requires the new process to stay up
+   `StableFor` (45s). If the new version crash-loops (3 deaths), cannot start 3 times in a way that
+   implicates the binary, or is not stable within `Deadline` (4 min), it **rolls back**:
+   mark-bad first, stop, `restorePrevious`, start. A Start refused for *environment* reasons (logon
+   failure, access denied, disabled) does NOT roll back - that says nothing about the binary.
+4. **Bad-version marker** (`.vectrify-runner-bad-version` next to the exe) — a rolled-back release is
+   not re-installed by the next hourly check (else: infinite install/crash/rollback loop). A newer
+   release is still eligible.
+5. **Fail closed** — if the SCM policy could not be verified AND the watchdog could not be spawned,
+   `apply()` undoes the swap and returns an error instead of exiting into a service that may never
+   come back.
+6. `exe.old` is no longer deleted at startup: it is the rollback target. `updater.Start` removes it
+   after `leftoverGrace` (6 min > watchdog `Deadline`); the watchdog removes it itself on success.
+
+`install.ps1` now uses `Set-RunnerRestartPolicy`, which sets the policy then **verifies it from the
+registry** (`FailureActions`) and throws if it is not all-restart; the "existing install" update path
+also repairs it. The runner has a `-version` flag (needed by the smoke test).
 
 Also note: the temp download path is unique per attempt
 (`exePath + ".new." + pid + "." + timestamp"`, not a fixed `.new` suffix) as
@@ -623,6 +669,8 @@ in the install summary output at the end of a successful install.
 
 ### Service lifecycle (Windows)
 
+Crash recovery matters here: auto-update relies on the SCM restarting the service (and on the
+watchdog as a second layer) - see "Windows update safety nets" under Auto-update.
 The binary uses `golang.org/x/sys/windows/svc` to detect whether it was launched
 by the Windows SCM. When running as a service, `service_windows.go` implements
 `svc.Handler` and handles `SERVICE_CONTROL_STOP` / `SHUTDOWN`. When running
