@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -84,6 +85,12 @@ type Client struct {
 	log      *slog.Logger
 	inflight *inflightRegistry // single source of truth for active dispatch count + detail
 
+	// lastActive is the unix-nano time a command was last received or finished.
+	// The auto-updater reads it (via Activity) so it never restarts the runner
+	// right after, or in the middle of, someone using it. Seeded in New() so a
+	// freshly started runner counts as active.
+	lastActive atomic.Int64
+
 	// dispatchFunc is the function dispatchOne calls once a slot has been
 	// acquired. Defaults to c.runner.Dispatch (set in New()); tests override
 	// it to inject panics/delays without needing a live Runner, so the
@@ -121,6 +128,7 @@ type Client struct {
 // hold) survive reconnects, so a stale-command warning must too.
 func New(cfg *config.Config, r *runner.Runner, log *slog.Logger) *Client {
 	c := &Client{cfg: cfg, runner: r, log: log, inflight: newInflightRegistry()}
+	c.touch()
 	c.dispatchFunc = r.Dispatch
 	c.acquireTimeout = func() time.Duration {
 		return time.Duration(c.cfg.SlotAcquireTimeoutSeconds) * time.Second
@@ -371,6 +379,10 @@ func (c *Client) connect() error {
 		cmdType := raw.Type()
 		class := classifyCommand(cmdType)
 
+		// Counts as activity even if the command is then rejected as busy: the
+		// runner is clearly in use. (Pings/pongs never reach here.)
+		c.touch()
+
 		if !c.tryReserveWaiter() {
 			c.log.Warn("dispatch: concurrency limit reached, rejecting command",
 				"cmd_id", cmdID,
@@ -415,6 +427,11 @@ func (c *Client) connect() error {
 // deferred to the end of this method.
 func (c *Client) dispatchOne(raw protocol.RawCommand, cmdID, cmdType string, send func(interface{}), triggerReconnect func()) {
 	class := classifyCommand(cmdType)
+
+	// Finishing a command is activity too (the quiet period is measured from
+	// the END of the last command, not just from when it arrived). Registered
+	// first so it runs last, after the in-flight entry has been removed.
+	defer c.touch()
 
 	// releaseWaiterOnce guards against ever double-releasing (releaseWaiter
 	// is called explicitly right after acquire() returns, AND unconditionally
@@ -533,6 +550,23 @@ func (c *Client) releaseWaiter() {
 	if c.pendingWaiters > 0 {
 		c.pendingWaiters--
 	}
+}
+
+// touch records "the runner was just used".
+func (c *Client) touch() { c.lastActive.Store(time.Now().UnixNano()) }
+
+// Activity reports how busy the runner is, for the auto-updater: whether any
+// command is in flight or waiting for a slot, and when a command was last
+// received or finished. Background processes started via the process tool and
+// open browser sessions deliberately do NOT count as activity - a forgotten dev
+// server would otherwise block updates forever. (An update still ends them, as
+// any restart does, but only after the runner has been idle.)
+func (c *Client) Activity() (busy bool, lastActive time.Time) {
+	busy = c.inflight.count() > 0 || c.pendingWaiterCount() > 0
+	if ns := c.lastActive.Load(); ns != 0 {
+		lastActive = time.Unix(0, ns)
+	}
+	return busy, lastActive
 }
 
 // pendingWaiterCount returns the current number of hand-off goroutines

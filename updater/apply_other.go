@@ -17,7 +17,7 @@ import (
 // the normal path — see the comment at the call site.
 const supervisorStopFallback = 10 * time.Second
 
-func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drain func(time.Duration), _ func(), lock *updateLock) error {
+func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drain func(time.Duration), _ func(), lock *updateLock, stillOK func() bool) error {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
 	assetName := fmt.Sprintf("vectrify-runner-%s-%s", goos, goarch)
@@ -71,6 +71,15 @@ func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drai
 		return fmt.Errorf("checksum verification failed: %w", err)
 	}
 	log.Info("auto-update: checksum verified")
+
+	// ── Last look before the point of no return ───────────────────────────────
+	// Download + verify take a while; if a command arrived in the meantime,
+	// back out cleanly (nothing has been touched yet) and let the next check
+	// try again once the runner is idle.
+	if stillOK != nil && !stillOK() {
+		os.Remove(tmpPath)
+		return errDeferred
+	}
 
 	// ── Drain in-flight commands before exiting ───────────────────────────────
 	if drain != nil {

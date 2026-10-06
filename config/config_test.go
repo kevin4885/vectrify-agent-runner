@@ -507,3 +507,53 @@ func TestLoad_AllowShell_ExplicitTrueHonored(t *testing.T) {
 		t.Error("AllowShell = false, want true for explicit allow_shell: true")
 	}
 }
+func TestLoad_UpdateTunables_DefaultTo5Minutes(t *testing.T) {
+	cfg, err := Load(writeTestConfig(t, minimalValidConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UpdateCheckIntervalSeconds != 300 || cfg.UpdateIdleSeconds != 300 {
+		t.Fatalf("defaults = %d / %d, want 300 / 300", cfg.UpdateCheckIntervalSeconds, cfg.UpdateIdleSeconds)
+	}
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("defaults must not warn: %v", cfg.Warnings)
+	}
+}
+
+func TestLoad_UpdateTunables_ExplicitHonored(t *testing.T) {
+	cfg, err := Load(writeTestConfig(t, minimalValidConfig+"\nupdate_check_interval_seconds: 60\nupdate_idle_seconds: 900\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UpdateCheckIntervalSeconds != 60 || cfg.UpdateIdleSeconds != 900 {
+		t.Fatalf("got %d / %d, want 60 / 900", cfg.UpdateCheckIntervalSeconds, cfg.UpdateIdleSeconds)
+	}
+}
+
+func TestLoad_UpdateTunables_ZeroOrNegativeFallBackToDefault(t *testing.T) {
+	for _, extra := range []string{"update_check_interval_seconds: 0", "update_check_interval_seconds: -5", "update_idle_seconds: 0", "update_idle_seconds: -1"} {
+		cfg, err := Load(writeTestConfig(t, minimalValidConfig+"\n"+extra+"\n"))
+		if err != nil {
+			t.Fatalf("%s: %v", extra, err)
+		}
+		if cfg.UpdateCheckIntervalSeconds != 300 || cfg.UpdateIdleSeconds != 300 {
+			t.Errorf("%s: got %d / %d, want defaults", extra, cfg.UpdateCheckIntervalSeconds, cfg.UpdateIdleSeconds)
+		}
+	}
+}
+
+func TestLoad_UpdateTunables_OutOfRangeClampedWithWarning(t *testing.T) {
+	cfg, err := Load(writeTestConfig(t, minimalValidConfig+"\nupdate_check_interval_seconds: 1\nupdate_idle_seconds: 99999999\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UpdateCheckIntervalSeconds != 30 {
+		t.Errorf("interval = %d, want floor 30", cfg.UpdateCheckIntervalSeconds)
+	}
+	if cfg.UpdateIdleSeconds != 86400 {
+		t.Errorf("idle = %d, want ceiling 86400", cfg.UpdateIdleSeconds)
+	}
+	if len(cfg.Warnings) != 2 {
+		t.Errorf("want 2 warnings (one per clamp), got %v", cfg.Warnings)
+	}
+}

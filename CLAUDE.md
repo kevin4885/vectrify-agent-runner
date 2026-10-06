@@ -56,9 +56,13 @@ vectrify-agent-runner/
 │   │                      PowerShell bootstrap that reads the command from a temp file — see "Shell launch" below
 │   └── browser.go         Playwright-driven browser automation (opt-in, see "Browser automation" below)
 ├── updater/
-│   ├── updater.go         Background auto-update loop: checks GitHub releases hourly, downloads +
+│   ├── updater.go         Background auto-update loop: checks for a new release every 5 min (configurable), downloads +
 │   │                      verifies the new binary, then swaps it (Windows: in-process; Linux/macOS: script; see
 │   │                      "Auto-update" below — has a subtle cross-platform gotcha, read before touching)
+│   ├── options.go         Options (check interval, idle window, Activity source) + the idle gate that defers an
+│   │                      update while the runner is in use (6h deferral cap)
+│   ├── release.go         Finds the latest release via the github.com /releases/latest REDIRECT (no API quota),
+│   │                      API only as fallback; failure-log throttling
 │   ├── lock.go            Cross-process update lock (prevents two runner processes on the same
 │   │                      machine from swapping the binary at the same time)
 │   ├── apply_windows.go   Windows: smoke-test candidate, verify SCM policy, in-process rename swap, spawn
@@ -244,6 +248,9 @@ max_heavy_concurrency: 24               # sub-limit for "heavy" commands (shell,
                                          # heavy slot is occupied
 slot_acquire_timeout_seconds: 3         # how long a command waits for a free slot before being
                                          # rejected as "runner busy", instead of rejecting instantly
+update_check_interval_seconds: 300      # how often to look for a new release (min 30, max 86400)
+update_idle_seconds: 300                # runner must be quiet this long before it applies an update
+                                         # (max 86400); a freshly started runner counts as active
 max_browser_sessions:  3                # max concurrent browser sessions (each = one Chromium
                                          # BrowserContext + Page kept alive across commands)
 browser_idle_timeout_seconds: 300       # auto-close a browser session after this many seconds of
@@ -508,8 +515,10 @@ refuses to install any release that doesn't have one (see "Auto-update" below).
 ## Auto-update
 
 Every installed runner (`updater.Start`, called from `main.go`/`service_windows.go`)
-checks GitHub for a newer release on startup and hourly thereafter, and self-updates
-in the background with no user interaction. High level: download the new binary,
+checks for a newer release on startup and every `update_check_interval_seconds`
+(default 5 min) thereafter, and self-updates in the background with no user interaction.
+**It only updates when the runner is idle** (see "Update timing" below). High level:
+download the new binary,
 verify its SHA256 against `checksums.txt`, drain in-flight commands, then swap the binary
 and restart the service. **Windows does the swap in-process** (`updater/swap.go`: rename
 the running exe to `exe.old`, move the verified new file to `exe`, exit, let the SCM
@@ -568,6 +577,31 @@ reopens this bug:
      (removes the job from supervision entirely) instead of `stop`. `apply_other.go`
      branches on `runtime.GOOS` for exactly this reason — don't unify the Linux and
      macOS paths, they need genuinely different supervisor calls.
+### Update timing: check cadence and the idle gate
+
+- **Check cadence** (`update_check_interval_seconds`, default 300, floor 30). Cheap by design: the
+  check is `GET https://github.com/<repo>/releases/latest` with redirects disabled; the `Location`
+  header carries the tag, and asset URLs are built from it (`releases/download/<tag>/<asset>`).
+  **Do not switch this back to the REST API**: unauthenticated API calls are limited to 60/hour/IP
+  and a conditional request that returns 304 STILL counts (verified) - at 12 checks/hour a few
+  runners behind one IP would exhaust it and silently stop updating. The API is used only as a
+  fallback when the redirect route fails. Failed checks log WARN on the first failure and then about
+  hourly, so an offline machine does not spam the log.
+- **Idle gate** (`update_idle_seconds`, default 300; `options.go`). A found update is applied only if
+  no command is in flight or waiting for a slot AND no command was received or finished in the last
+  idle window. `client.Activity()` supplies this; `touch()` is called when a command is received (even
+  if then rejected as busy) and when one finishes, so the quiet period runs from the END of the last
+  command. A freshly started runner counts as active (so an update never chains straight into
+  another). Background processes (process tool) and open browser sessions deliberately do NOT count -
+  a forgotten dev server would block updates forever.
+- The gate runs BEFORE the lock and download (a busy runner does no work), and `apply()` re-checks it
+  once the download is verified, right before the point of no return; if a command arrived meanwhile
+  it returns `errDeferred`, deletes the temp file, and the next check retries.
+- **Deferral cap:** if the runner is *continuously* active for 6h (`maxDeferral`) the update is
+  applied anyway (after the normal 30s drain), so a never-quiet runner cannot stay on an old version
+  forever. The deferral clock resets when the runner goes idle or the runner is up to date. A still-
+  deferred update is announced at INFO once, then hourly; otherwise DEBUG.
+
 ### Windows update safety nets (added after the 1.0.23 outage) — read before touching `apply_windows.go`
 
 **Incident:** after the 1.0.22 and 1.0.23 auto-updates the service stayed **down for ~11 hours**

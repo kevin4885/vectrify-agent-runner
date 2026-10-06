@@ -21,6 +21,7 @@ type winSvc struct {
 	log    *slog.Logger
 	client *client.Client
 	runner *runner.Runner
+	uo     updater.Options
 }
 
 // Execute is the entry point called by the Windows SCM when the service starts.
@@ -36,7 +37,7 @@ func (s *winSvc) Execute(_ []string, r <-chan svc.ChangeRequest, status chan<- s
 	// start-up, and never blocks or fails the service.
 	go s.checkRecoveryPolicy()
 
-	updater.Start(config.Version, s.log, s.client.Drain, s.runner.Shutdown)
+	updater.Start(config.Version, s.log, s.client.Drain, s.runner.Shutdown, s.uo)
 
 	// Run the connection loop in the background so this goroutine stays free
 	// to handle SCM control requests.
@@ -76,14 +77,14 @@ func (s *winSvc) checkRecoveryPolicy() {
 
 // runService detects whether the process was launched by the Windows SCM and
 // runs in service mode if so, otherwise falls back to interactive (terminal) mode.
-func runService(log *slog.Logger, c *client.Client, r *runner.Runner) {
+func runService(log *slog.Logger, c *client.Client, r *runner.Runner, uo updater.Options) {
 	isService, err := svc.IsWindowsService()
 	if err != nil || !isService {
-		runInteractive(log, c, r)
+		runInteractive(log, c, r, uo)
 		return
 	}
 	log.Info("starting as windows service")
-	if err := svc.Run("VectrifyRunner", &winSvc{log: log, client: c, runner: r}); err != nil {
+	if err := svc.Run("VectrifyRunner", &winSvc{log: log, client: c, runner: r, uo: uo}); err != nil {
 		log.Error("service run failed", "err", err)
 		os.Exit(1)
 	}

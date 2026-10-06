@@ -36,6 +36,18 @@ const (
 	defaultMaxHeavyConcurrency       = 24
 	defaultSlotAcquireTimeoutSeconds = 3
 
+	// Auto-update tunables (see the updater package). Both default to 5 minutes.
+	defaultUpdateCheckIntervalSeconds = 300
+	defaultUpdateIdleSeconds          = 300
+
+	// minUpdateCheckIntervalSeconds floors update_check_interval_seconds. The
+	// check is a cheap redirect, not an API call, but a typo of "1" should not
+	// make every runner hit github.com once a second.
+	minUpdateCheckIntervalSeconds = 30
+	// maxSaneUpdateSeconds caps both update knobs at one day: a larger value is
+	// almost certainly a typo and would effectively disable auto-update.
+	maxSaneUpdateSeconds = 86400
+
 	// maxSaneConcurrency is a sanity ceiling on max_concurrency, clamped
 	// (with a warning) rather than honored verbatim. Without it, a typo'd
 	// config value (e.g. an extra zero: "3200000") would silently remove
@@ -177,6 +189,17 @@ type Config struct {
 	// normal, brief oversubscription that happens when sub-agents fan out
 	// several tool calls at once. Defaults to 3.
 	SlotAcquireTimeoutSeconds int `yaml:"slot_acquire_timeout_seconds"`
+
+	// UpdateCheckIntervalSeconds is how often the runner looks for a new
+	// release. Defaults to 300 (5 minutes); minimum 30, maximum 86400.
+	UpdateCheckIntervalSeconds int `yaml:"update_check_interval_seconds"`
+
+	// UpdateIdleSeconds is how long the runner must be quiet (no command in
+	// flight, none received or finished) before it will apply a found update,
+	// so an update never interrupts or lands right after someone using the
+	// runner. Defaults to 300 (5 minutes); maximum 86400. A freshly started
+	// runner counts as active, so it never updates in its first idle window.
+	UpdateIdleSeconds int `yaml:"update_idle_seconds"`
 
 	// MaxBrowserSessions caps how many browser sessions (each one Chromium
 	// BrowserContext + Page kept alive across multiple "browser" commands)
@@ -344,6 +367,30 @@ func (c *Config) applyDefaults() {
 			c.MaxConcurrency, maxSaneConcurrency, maxSaneConcurrency,
 		))
 		c.MaxConcurrency = maxSaneConcurrency
+	}
+	if c.UpdateCheckIntervalSeconds <= 0 {
+		c.UpdateCheckIntervalSeconds = defaultUpdateCheckIntervalSeconds
+	} else if c.UpdateCheckIntervalSeconds < minUpdateCheckIntervalSeconds {
+		c.Warnings = append(c.Warnings, fmt.Sprintf(
+			"update_check_interval_seconds (%d) is below the minimum of %d; raising update_check_interval_seconds to %d",
+			c.UpdateCheckIntervalSeconds, minUpdateCheckIntervalSeconds, minUpdateCheckIntervalSeconds,
+		))
+		c.UpdateCheckIntervalSeconds = minUpdateCheckIntervalSeconds
+	} else if c.UpdateCheckIntervalSeconds > maxSaneUpdateSeconds {
+		c.Warnings = append(c.Warnings, fmt.Sprintf(
+			"update_check_interval_seconds (%d) exceeds the sanity ceiling of %d; clamping update_check_interval_seconds to %d",
+			c.UpdateCheckIntervalSeconds, maxSaneUpdateSeconds, maxSaneUpdateSeconds,
+		))
+		c.UpdateCheckIntervalSeconds = maxSaneUpdateSeconds
+	}
+	if c.UpdateIdleSeconds <= 0 {
+		c.UpdateIdleSeconds = defaultUpdateIdleSeconds
+	} else if c.UpdateIdleSeconds > maxSaneUpdateSeconds {
+		c.Warnings = append(c.Warnings, fmt.Sprintf(
+			"update_idle_seconds (%d) exceeds the sanity ceiling of %d; clamping update_idle_seconds to %d",
+			c.UpdateIdleSeconds, maxSaneUpdateSeconds, maxSaneUpdateSeconds,
+		))
+		c.UpdateIdleSeconds = maxSaneUpdateSeconds
 	}
 	if c.SlotAcquireTimeoutSeconds <= 0 {
 		c.SlotAcquireTimeoutSeconds = defaultSlotAcquireTimeoutSeconds

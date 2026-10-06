@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/mxschmitt/playwright-go"
 
@@ -127,13 +128,26 @@ func main() {
 
 	r := runner.New(cfg, log)
 	c := client.New(cfg, r, log)
-	runService(log, c, r)
+	runService(log, c, r, updaterOptions(cfg, c))
+}
+
+// updaterOptions builds the auto-updater settings from config + the client's
+// activity tracker.
+func updaterOptions(cfg *config.Config, c *client.Client) updater.Options {
+	return updater.Options{
+		CheckInterval: time.Duration(cfg.UpdateCheckIntervalSeconds) * time.Second,
+		IdleWindow:    time.Duration(cfg.UpdateIdleSeconds) * time.Second,
+		Activity: func() updater.Activity {
+			busy, last := c.Activity()
+			return updater.Activity{Busy: busy, LastActive: last}
+		},
+	}
 }
 
 // runInteractive runs the client with OS signal handling for graceful shutdown.
 // Used on all platforms when running directly in a terminal (not as a service daemon).
-func runInteractive(log *slog.Logger, c *client.Client, r *runner.Runner) {
-	updater.Start(config.Version, log, c.Drain, r.Shutdown)
+func runInteractive(log *slog.Logger, c *client.Client, r *runner.Runner, uo updater.Options) {
+	updater.Start(config.Version, log, c.Drain, r.Shutdown, uo)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {

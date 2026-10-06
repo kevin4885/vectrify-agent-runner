@@ -13,7 +13,7 @@ import (
 	"vectrify/agent-runner/winsvc"
 )
 
-func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drain func(time.Duration), beforeExit func(), lock *updateLock) error {
+func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drain func(time.Duration), beforeExit func(), lock *updateLock, stillOK func() bool) error {
 	assetName := "vectrify-runner-windows-amd64.exe"
 	manifestName := "checksums.txt"
 
@@ -90,6 +90,15 @@ func apply(exePath, version string, assets []githubAsset, log *slog.Logger, drai
 		} else {
 			policyOK = true
 		}
+	}
+
+	// -- Last look before the point of no return ----------------------------
+	// Download + verify + smoke test take a while; if a command arrived in the
+	// meantime, back out cleanly (nothing has been touched yet) and let the
+	// next check try again once the runner is idle.
+	if stillOK != nil && !stillOK() {
+		os.Remove(tmpPath)
+		return errDeferred
 	}
 
 	// -- Drain in-flight commands before exiting ----------------------------
