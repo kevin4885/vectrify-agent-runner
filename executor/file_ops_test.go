@@ -251,9 +251,9 @@ func TestStrReplace_CRLFFile_LFOldStr(t *testing.T) {
 	if !strings.Contains(raw, "return 1") {
 		t.Errorf("replacement not applied to CRLF file: %q", raw)
 	}
-	// After replacement file should be LF
-	if strings.Contains(raw, "\r\n") {
-		t.Errorf("file should be written as LF after StrReplace: %q", raw)
+	// The file's CRLF style is preserved byte-for-byte.
+	if want := "def foo():\r\n    return 1\r\n"; raw != want {
+		t.Errorf("CRLF style must be preserved: got %q, want %q", raw, want)
 	}
 }
 
@@ -304,20 +304,27 @@ func TestStrReplace_MultipleOccurrences(t *testing.T) {
 	}
 }
 
-func TestStrReplace_WritesLFAfterReplace(t *testing.T) {
-	ops, root, cleanup := newTestOps(t)
-	defer cleanup()
-
-	// Mixed line endings edge case
-	p := writeRaw(t, root, "mixed.txt", []byte("a\r\nb\nc\r\n"))
-
-	_, err := ops.StrReplace(p, "a\nb", "x\ny")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestStrReplace_MixedEndings_MajorityWins(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"majority CRLF", "a\r\nb\nc\r\n", "x\r\ny\r\nc\r\n"},
+		{"majority LF", "a\nb\r\nc\n", "x\ny\nc\n"},
+		{"tie is LF", "a\r\nb\n", "x\ny\n"},
 	}
-	raw := readRaw(t, p)
-	if strings.Contains(string(raw), "\r\n") {
-		t.Errorf("file must be written with LF after StrReplace: %q", raw)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops, root, cleanup := newTestOps(t)
+			defer cleanup()
+
+			p := writeRaw(t, root, "mixed.txt", []byte(tc.in))
+			if _, err := ops.StrReplace(p, "a\nb", "x\ny"); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := string(readRaw(t, p)); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -344,7 +351,7 @@ func TestInsert_LFFile(t *testing.T) {
 	}
 }
 
-func TestInsert_CRLFFile_WritesLF(t *testing.T) {
+func TestInsert_CRLFFile_PreservesCRLF(t *testing.T) {
 	ops, root, cleanup := newTestOps(t)
 	defer cleanup()
 
@@ -354,12 +361,8 @@ func TestInsert_CRLFFile_WritesLF(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	raw := readRaw(t, p)
-	if strings.Contains(string(raw), "\r\n") {
-		t.Errorf("Insert must write LF after operating on CRLF file: %q", raw)
-	}
-	if !strings.Contains(string(raw), "newline") {
-		t.Errorf("inserted text not found: %q", raw)
+	if got, want := string(readRaw(t, p)), "line1\r\nnewline\r\nline2\r\nline3\r\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
@@ -388,6 +391,289 @@ func TestInsert_InvalidLine(t *testing.T) {
 	_, err := ops.Insert(p, 999, "x")
 	if err == nil {
 		t.Fatal("expected error for out-of-range line number, got nil")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Line-ending preservation (C1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestDetectLineEnding(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		crlf bool
+	}{
+		{"empty", "", false},
+		{"no newline", "abc", false},
+		{"lf", "a\nb\n", false},
+		{"crlf", "a\r\nb\r\n", true},
+		{"majority crlf", "a\r\nb\nc\r\n", true},
+		{"majority lf", "a\nb\r\nc\n", false},
+		{"tie", "a\r\nb\n", false},
+		{"lone cr ignored", "a\rb\r\n", true},
+		{"leading lf", "\nabc", false},
+	}
+	for _, tc := range cases {
+		if got := detectLineEnding([]byte(tc.in)); got != tc.crlf {
+			t.Errorf("%s: detectLineEnding(%q) = %v, want %v", tc.name, tc.in, got, tc.crlf)
+		}
+	}
+}
+
+func TestStrReplace_LFFile_NoCarriageReturn(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	p := writeRaw(t, root, "lf.txt", []byte("a\nb\nc\n"))
+	// CRLF in the arguments must not leak into an LF file.
+	if _, err := ops.StrReplace(p, "a\r\nb", "x\r\ny\r\nz"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := string(readRaw(t, p))
+	if want := "x\ny\nz\nc\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	if strings.Contains(got, "\r") {
+		t.Errorf("LF file must contain no \\r: %q", got)
+	}
+}
+
+func TestStrReplace_CRLFFile_MultiLineNewStr(t *testing.T) {
+	cases := []struct {
+		name, newStr string
+	}{
+		{"LF new_str", "x\ny\nz"},
+		{"CRLF new_str", "x\r\ny\r\nz"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops, root, cleanup := newTestOps(t)
+			defer cleanup()
+
+			p := writeRaw(t, root, "c.txt", []byte("a\r\nb\r\nc\r\n"))
+			if _, err := ops.StrReplace(p, "b", tc.newStr); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got := string(readRaw(t, p))
+			if want := "a\r\nx\r\ny\r\nz\r\nc\r\n"; got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+			if strings.Contains(got, "\r\r") {
+				t.Errorf("must not contain \\r\\r: %q", got)
+			}
+			if strings.Contains(strings.ReplaceAll(got, "\r\n", ""), "\n") {
+				t.Errorf("bare LF found in CRLF file: %q", got)
+			}
+		})
+	}
+}
+
+func TestStrReplace_FinalNewlinePreserved(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"crlf without trailing newline", "a\r\nb", "a\r\nX"},
+		{"crlf with trailing newline", "a\r\nb\r\n", "a\r\nX\r\n"},
+		{"lf without trailing newline", "a\nb", "a\nX"},
+		{"lf with trailing newline", "a\nb\n", "a\nX\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops, root, cleanup := newTestOps(t)
+			defer cleanup()
+
+			p := writeRaw(t, root, "f.txt", []byte(tc.in))
+			if _, err := ops.StrReplace(p, "b", "X"); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := string(readRaw(t, p)); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStrReplace_ReturnString(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	p := writeRaw(t, root, "f.txt", []byte("a\r\n"))
+	msg, err := ops.StrReplace(p, "a", "b")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := "Successfully replaced text at exactly one location."; msg != want {
+		t.Errorf("got %q, want %q", msg, want)
+	}
+}
+
+func TestInsert_Positions(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     string
+		line   int
+		newStr string
+		want   string
+	}{
+		{"crlf after line 1", "a\r\nb\r\nc\r\n", 1, "X", "a\r\nX\r\nb\r\nc\r\n"},
+		{"crlf middle", "a\r\nb\r\nc\r\nd\r\n", 2, "X", "a\r\nb\r\nX\r\nc\r\nd\r\n"},
+		{"crlf at last line", "a\r\nb\r\nc\r\n", 3, "X", "a\r\nb\r\nc\r\nX\r\n"},
+		{"crlf at last line no final newline", "a\r\nb\r\nc", 3, "X", "a\r\nb\r\nc\r\nX"},
+		{"crlf at line 0", "a\r\nb\r\n", 0, "X", "X\r\na\r\nb\r\n"},
+		{"crlf multi-line LF insert", "a\r\nb\r\n", 1, "X\nY", "a\r\nX\r\nY\r\nb\r\n"},
+		{"crlf multi-line CRLF insert", "a\r\nb\r\n", 1, "X\r\nY", "a\r\nX\r\nY\r\nb\r\n"},
+		{"crlf insert with trailing newline", "a\r\nb\r\n", 1, "X\n", "a\r\nX\r\nb\r\n"},
+		{"lf after line 1", "a\nb\nc\n", 1, "X", "a\nX\nb\nc\n"},
+		{"lf at last line", "a\nb\nc\n", 3, "X", "a\nb\nc\nX\n"},
+		{"lf at last line no final newline", "a\nb\nc", 3, "X", "a\nb\nc\nX"},
+		{"lf insert with CRLF text", "a\nb\n", 1, "X\r\nY", "a\nX\nY\nb\n"},
+		{"mixed majority crlf", "a\r\nb\nc\r\n", 1, "X", "a\r\nX\r\nb\r\nc\r\n"},
+		{"mixed majority lf", "a\nb\r\nc\n", 1, "X", "a\nX\nb\nc\n"},
+		{"mixed tie is lf", "a\r\nb\n", 1, "X", "a\nX\nb\n"},
+		{"empty file is lf", "", 0, "X", "X\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops, root, cleanup := newTestOps(t)
+			defer cleanup()
+
+			p := writeRaw(t, root, "f.txt", []byte(tc.in))
+			msg, err := ops.Insert(p, tc.line, tc.newStr)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if want := fmt.Sprintf("Successfully inserted text after line %d.", tc.line); msg != want {
+				t.Errorf("message: got %q, want %q", msg, want)
+			}
+			if got := string(readRaw(t, p)); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWriteFile_OverExistingFile_UsesExistingStyle(t *testing.T) {
+	cases := []struct {
+		name, existing, content, want string
+	}{
+		{"CRLF file, LF content", "old\r\nfile\r\n", "new\nbody\n", "new\r\nbody\r\n"},
+		{"CRLF file, CRLF content", "old\r\nfile\r\n", "new\r\nbody\r\n", "new\r\nbody\r\n"},
+		{"LF file, CRLF content", "old\nfile\n", "new\r\nbody\r\n", "new\nbody\n"},
+		{"LF file, LF content", "old\nfile\n", "new\nbody\n", "new\nbody\n"},
+		{"empty file, CRLF content", "", "new\r\nbody\r\n", "new\nbody\n"},
+		{"empty file, LF content", "", "new\nbody", "new\nbody"},
+		{"CRLF file, no final newline", "old\r\nfile", "new\nbody", "new\r\nbody"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops, root, cleanup := newTestOps(t)
+			defer cleanup()
+
+			p := writeRaw(t, root, "f.txt", []byte(tc.existing))
+			if err := ops.WriteFile(p, tc.content); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := string(readRaw(t, p)); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWriteFile_NewFile_AlwaysLF(t *testing.T) {
+	cases := []struct {
+		name, content, want string
+	}{
+		{"LF content", "a\nb\n", "a\nb\n"},
+		{"CRLF content", "a\r\nb\r\n", "a\nb\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops, root, cleanup := newTestOps(t)
+			defer cleanup()
+
+			p := filepath.Join(root, "new.txt")
+			if err := ops.WriteFile(p, tc.content); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := string(readRaw(t, p)); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEditFailures_LeaveFileUntouched(t *testing.T) {
+	const orig = "foo\r\nfoo\r\nbar\r\n"
+	run := func(t *testing.T, name string, op func(ops *FileOps, p string) (string, error), wantErr string) {
+		t.Run(name, func(t *testing.T) {
+			ops, root, cleanup := newTestOps(t)
+			defer cleanup()
+
+			p := writeRaw(t, root, "f.txt", []byte(orig))
+			_, err := op(ops, p)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if err.Error() != wantErr {
+				t.Errorf("error: got %q, want %q", err.Error(), wantErr)
+			}
+			if got := string(readRaw(t, p)); got != orig {
+				t.Errorf("file modified on error path: %q", got)
+			}
+		})
+	}
+	run(t, "str_replace not found", func(ops *FileOps, p string) (string, error) {
+		return ops.StrReplace(p, "missing", "x")
+	}, "the specified text was not found in the file")
+	run(t, "str_replace multiple", func(ops *FileOps, p string) (string, error) {
+		return ops.StrReplace(p, "foo", "x")
+	}, "found 2 occurrences of the specified text — must be unique")
+	// "foo\r\nfoo\r\nbar\r\n" splits into 4 elements (trailing empty one).
+	run(t, "insert negative line", func(ops *FileOps, p string) (string, error) {
+		return ops.Insert(p, -1, "x")
+	}, "invalid line number -1 (file has 4 lines)")
+	run(t, "insert past end", func(ops *FileOps, p string) (string, error) {
+		return ops.Insert(p, 99, "x")
+	}, "invalid line number 99 (file has 4 lines)")
+}
+
+func TestEdit_NonexistentPath(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	p := filepath.Join(root, "nope.txt")
+	if _, err := ops.StrReplace(p, "a", "b"); err == nil || err.Error() != "file not found: "+p {
+		t.Errorf("StrReplace: got %v", err)
+	}
+	if _, err := ops.Insert(p, 0, "b"); err == nil || err.Error() != "file not found: "+p {
+		t.Errorf("Insert: got %v", err)
+	}
+	if _, err := os.Stat(p); err == nil {
+		t.Error("edit of a nonexistent path must not create the file")
+	}
+}
+
+func TestEdit_OutsideWorkspaceRejected(t *testing.T) {
+	ops, _, cleanup := newTestOps(t)
+	defer cleanup()
+
+	outside := filepath.Join(t.TempDir(), "x.txt")
+	if err := os.WriteFile(outside, []byte("a\r\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ops.StrReplace(outside, "a", "b"); err == nil {
+		t.Error("StrReplace outside workspace must be rejected")
+	}
+	if _, err := ops.Insert(outside, 0, "b"); err == nil {
+		t.Error("Insert outside workspace must be rejected")
+	}
+	if err := ops.WriteFile(outside, "b"); err == nil {
+		t.Error("WriteFile outside workspace must be rejected")
+	}
+	if got := string(readRaw(t, outside)); got != "a\r\n" {
+		t.Errorf("outside file modified: %q", got)
 	}
 }
 
