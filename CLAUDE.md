@@ -216,6 +216,14 @@ All messages are JSON over the WebSocket.
 - Classified `heavy` in `client/classify.go` (same reasoning as `shell` — a
   process `start` is exactly the kind of external-process-spawn action that
   sub-limit exists to bound).
+- Lifecycle (`executor/process.go`): `logs` seeks to read only the last
+  `maxLogBytes` of the log file (`readLogTail`, start advanced to a UTF-8
+  boundary). Log files are named `vectrify-proc-<id>-<nanos>.log` in
+  `<tmp>/vectrify-runner-process-logs` and are deleted on stop / shutdown /
+  reap once `waitForExit` has closed them; `NewProcessManager` sweeps prefixed
+  files older than the max age (that directory only, regular files only). The
+  `max_background_processes` limit and duplicate `process_id` are re-checked
+  atomically at insertion; a launched-but-rejected child is killed and waited.
 
 ### Runner → API (responses)
 ```json
