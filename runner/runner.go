@@ -1,4 +1,4 @@
-// Package runner implements the main command dispatch loop.
+﻿// Package runner implements the main command dispatch loop.
 // It reads RawCommand messages from the WebSocket client, routes them to the
 // appropriate executor, and writes back result/stream/done/error responses.
 package runner

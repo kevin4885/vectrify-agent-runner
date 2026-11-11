@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -372,10 +373,30 @@ func atomicWriteFile(dest string, data []byte) (err error) {
 	if err = tmp.Close(); err != nil {
 		return fmt.Errorf("closing temp file: %w", err)
 	}
-	if err = renameFile(tmpName, target); err != nil {
+	if err = renameWithRetry(tmpName, target); err != nil {
 		return fmt.Errorf("replacing file: %w", err)
 	}
 	return nil
+}
+
+// renameWithRetry renames oldpath over newpath. On Windows a rename can fail
+// transiently (sharing violation / access denied) while an editor or virus
+// scanner briefly has the destination open, so a few short retries are made.
+func renameWithRetry(oldpath, newpath string) error {
+	attempts := 1
+	if runtime.GOOS == "windows" {
+		attempts = 5
+	}
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = renameFile(oldpath, newpath); err == nil {
+			return nil
+		}
+		if i < attempts-1 {
+			time.Sleep(time.Duration(10*(i+1)) * time.Millisecond)
+		}
+	}
+	return err
 }
 
 // WriteFile creates or overwrites a file with the given content. See Create.
