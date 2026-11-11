@@ -190,8 +190,35 @@ func (f *FileOps) listDir(path string) (string, error) {
 	return sb.String(), nil
 }
 
+// detectLineEnding reports whether data is predominantly CRLF. A file is CRLF
+// iff it has strictly more "\r\n" sequences than bare "\n" (a "\n" not
+// preceded by "\r"). Empty files, LF files and ties are LF.
+func detectLineEnding(data []byte) (crlf bool) {
+	crlfCount, bareLF := 0, 0
+	for i, b := range data {
+		if b != '\n' {
+			continue
+		}
+		if i > 0 && data[i-1] == '\r' {
+			crlfCount++
+		} else {
+			bareLF++
+		}
+	}
+	return crlfCount > bareLF
+}
+
+// toDiskEndings converts LF-normalised text to the on-disk line-ending style.
+func toDiskEndings(s string, crlf bool) string {
+	if crlf {
+		return strings.ReplaceAll(s, "\n", "\r\n")
+	}
+	return s
+}
+
 // WriteFile creates or overwrites a file with the given content.
-// Incoming content is normalized to LF so files on disk stay consistent.
+// Incoming content is normalized to LF internally. A new file is written as
+// LF; an existing file keeps its detected line-ending style (CRLF or LF).
 func (f *FileOps) WriteFile(path, content string) error {
 	clean, err := f.guardPath(path)
 	if err != nil {
@@ -203,7 +230,11 @@ func (f *FileOps) WriteFile(path, content string) error {
 		return fmt.Errorf("creating parent directories: %w", err)
 	}
 	content = strings.ReplaceAll(content, "\r\n", "\n")
-	return os.WriteFile(clean, []byte(content), 0644)
+	crlf := false
+	if existing, err := os.ReadFile(clean); err == nil {
+		crlf = detectLineEnding(existing)
+	}
+	return os.WriteFile(clean, []byte(toDiskEndings(content, crlf)), 0644)
 }
 
 // StrReplace replaces exactly one unique occurrence of oldStr with newStr.
@@ -231,7 +262,7 @@ func (f *FileOps) StrReplace(path, oldStr, newStr string) (string, error) {
 		return "", fmt.Errorf("found %d occurrences of the specified text — must be unique", count)
 	}
 	result := strings.Replace(content, oldStr, newStr, 1)
-	if err := os.WriteFile(clean, []byte(result), 0644); err != nil {
+	if err := os.WriteFile(clean, []byte(toDiskEndings(result, detectLineEnding(data))), 0644); err != nil {
 		return "", fmt.Errorf("writing file: %w", err)
 	}
 	return "Successfully replaced text at exactly one location.", nil
@@ -256,18 +287,19 @@ func (f *FileOps) Insert(path string, lineNum int, newStr string) (string, error
 		return "", fmt.Errorf("invalid line number %d (file has %d lines)", lineNum, len(lines))
 	}
 
-	// Ensure the inserted line ends with \n if it is not the last line
-	text := newStr
-	if lineNum < len(lines) && !strings.HasSuffix(text, "\n") {
-		text += "\n"
-	}
+	// The inserted text becomes its own element(s) in the line list and the
+	// Join below supplies the separators, so one trailing newline on newStr is
+	// dropped — otherwise it would add a spurious blank line and change the
+	// file's final-newline state.
+	text := strings.TrimSuffix(strings.ReplaceAll(newStr, "\r\n", "\n"), "\n")
 
 	newLines := make([]string, 0, len(lines)+1)
 	newLines = append(newLines, lines[:lineNum]...)
 	newLines = append(newLines, text)
 	newLines = append(newLines, lines[lineNum:]...)
 
-	if err := os.WriteFile(clean, []byte(strings.Join(newLines, "\n")), 0644); err != nil {
+	result := toDiskEndings(strings.Join(newLines, "\n"), detectLineEnding(data))
+	if err := os.WriteFile(clean, []byte(result), 0644); err != nil {
 		return "", fmt.Errorf("writing file: %w", err)
 	}
 	return fmt.Sprintf("Successfully inserted text after line %d.", lineNum), nil
