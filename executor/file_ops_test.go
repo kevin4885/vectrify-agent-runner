@@ -1,12 +1,17 @@
 package executor
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 // newTestOps creates a FileOps rooted at a fresh temp directory.
@@ -791,5 +796,513 @@ func TestFileOps_ConcurrentMixedOps_SamePath_RaceDetectorClean(t *testing.T) {
 	data := readRaw(t, p)
 	if len(data) == 0 {
 		t.Fatal("file ended up empty after concurrent mixed ops")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// File integrity (C1'): atomic writes, BOM, binary refusal, validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// listNames returns the names of all entries in dir.
+func listNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+func TestAtomicWriteFile_SuccessReplacesContentLeavesNoTemp(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(p, []byte("old content that is longer"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicWriteFile(p, []byte("new")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := string(readRaw(t, p)); got != "new" {
+		t.Errorf("content: got %q, want %q", got, "new")
+	}
+	if names := listNames(t, dir); len(names) != 1 || names[0] != "f.txt" {
+		t.Errorf("temp files left behind: %v", names)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Errorf("mode bits not preserved: got %v, want 0600", info.Mode().Perm())
+		}
+	}
+}
+
+func TestAtomicWriteFile_NewFileMode0644(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "new.txt")
+	if err := atomicWriteFile(p, []byte("x")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0644 {
+			t.Errorf("new file mode: got %v, want 0644", info.Mode().Perm())
+		}
+	}
+	if got := string(readRaw(t, p)); got != "x" {
+		t.Errorf("content: got %q", got)
+	}
+}
+
+func TestAtomicWriteFile_RenameFailure_OriginalUntouchedTempRemoved(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "f.txt")
+	orig := []byte("original\r\ncontent\r\n")
+	if err := os.WriteFile(p, orig, 0644); err != nil {
+		t.Fatal(err)
+	}
+	saved := renameFile
+	renameFile = func(oldpath, newpath string) error { return errors.New("injected rename failure") }
+	defer func() { renameFile = saved }()
+
+	if err := atomicWriteFile(p, []byte("replacement")); err == nil {
+		t.Fatal("expected error from injected rename failure, got nil")
+	}
+	if got := readRaw(t, p); !bytes.Equal(got, orig) {
+		t.Errorf("original modified: got %q, want %q", got, orig)
+	}
+	if names := listNames(t, dir); len(names) != 1 || names[0] != "f.txt" {
+		t.Errorf("temp file not removed: %v", names)
+	}
+}
+
+func TestEdits_RenameFailure_LeaveOriginalIntact(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	orig := []byte("a\r\nb\r\n")
+	p := writeRaw(t, root, "f.txt", orig)
+	saved := renameFile
+	renameFile = func(oldpath, newpath string) error { return errors.New("injected rename failure") }
+	defer func() { renameFile = saved }()
+
+	if _, err := ops.StrReplace(p, "a", "x"); err == nil {
+		t.Error("StrReplace: expected error")
+	}
+	if _, err := ops.Insert(p, 1, "x"); err == nil {
+		t.Error("Insert: expected error")
+	}
+	if err := ops.WriteFile(p, "zzz"); err == nil {
+		t.Error("WriteFile: expected error")
+	}
+	if got := readRaw(t, p); !bytes.Equal(got, orig) {
+		t.Errorf("original modified: %q", got)
+	}
+	if names := listNames(t, root); len(names) != 1 {
+		t.Errorf("temp file left behind: %v", names)
+	}
+}
+
+func TestStrReplace_ThroughSymlink_LinkSurvives(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	target := writeRaw(t, root, "target.txt", []byte("hello\r\nworld\r\n"))
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	if _, err := ops.StrReplace(link, "hello", "bye"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Error("link was replaced by a regular file")
+	}
+	if got, want := string(readRaw(t, target)), "bye\r\nworld\r\n"; got != want {
+		t.Errorf("target content: got %q, want %q", got, want)
+	}
+	if _, err := ops.Insert(link, 0, "top"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if info, _ := os.Lstat(link); info.Mode()&os.ModeSymlink == 0 {
+		t.Error("link was replaced by a regular file after insert")
+	}
+	if got, want := string(readRaw(t, target)), "top\r\nbye\r\nworld\r\n"; got != want {
+		t.Errorf("target content after insert: got %q, want %q", got, want)
+	}
+}
+
+func TestBOM_Preserved(t *testing.T) {
+	bom := "\xEF\xBB\xBF"
+	t.Run("str_replace", func(t *testing.T) {
+		ops, root, cleanup := newTestOps(t)
+		defer cleanup()
+		p := writeRaw(t, root, "f.txt", []byte(bom+"a\r\nb\r\n"))
+		if _, err := ops.StrReplace(p, "a", "X"); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := string(readRaw(t, p)), bom+"X\r\nb\r\n"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+	t.Run("str_replace can match first line text", func(t *testing.T) {
+		ops, root, cleanup := newTestOps(t)
+		defer cleanup()
+		p := writeRaw(t, root, "f.txt", []byte(bom+"a\nb\n"))
+		if _, err := ops.StrReplace(p, "a\nb", "Q"); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := string(readRaw(t, p)), bom+"Q\n"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+	t.Run("insert after line 0", func(t *testing.T) {
+		ops, root, cleanup := newTestOps(t)
+		defer cleanup()
+		p := writeRaw(t, root, "f.txt", []byte(bom+"a\r\nb\r\n"))
+		if _, err := ops.Insert(p, 0, "X"); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := string(readRaw(t, p)), bom+"X\r\na\r\nb\r\n"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+	t.Run("create over BOM file keeps BOM", func(t *testing.T) {
+		ops, root, cleanup := newTestOps(t)
+		defer cleanup()
+		p := writeRaw(t, root, "f.txt", []byte(bom+"a\r\nb\r\n"))
+		if err := ops.WriteFile(p, "new\nbody\n"); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := string(readRaw(t, p)), bom+"new\r\nbody\r\n"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+	t.Run("create with own U+FEFF not doubled", func(t *testing.T) {
+		ops, root, cleanup := newTestOps(t)
+		defer cleanup()
+		p := writeRaw(t, root, "f.txt", []byte(bom+"a\r\n"))
+		if err := ops.WriteFile(p, "\uFEFFnew\n"); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := string(readRaw(t, p)), bom+"new\r\n"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+	t.Run("new file gets no BOM", func(t *testing.T) {
+		ops, root, cleanup := newTestOps(t)
+		defer cleanup()
+		p := filepath.Join(root, "new.txt")
+		if err := ops.WriteFile(p, "hi\n"); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(readRaw(t, p)); got != "hi\n" {
+			t.Errorf("got %q", got)
+		}
+	})
+	t.Run("file without BOM stays without BOM", func(t *testing.T) {
+		ops, root, cleanup := newTestOps(t)
+		defer cleanup()
+		p := writeRaw(t, root, "f.txt", []byte("a\nb\n"))
+		if _, err := ops.StrReplace(p, "a", "X"); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(readRaw(t, p)); got != "X\nb\n" {
+			t.Errorf("got %q", got)
+		}
+	})
+	t.Run("view hides BOM", func(t *testing.T) {
+		ops, root, cleanup := newTestOps(t)
+		defer cleanup()
+		p := writeRaw(t, root, "f.txt", []byte(bom+"a\r\nb\r\n"))
+		out, err := ops.ReadFile(p, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(out, "\uFEFF") {
+			t.Errorf("view contains U+FEFF: %q", out)
+		}
+		if want := "1: a\n2: b\n"; out != want {
+			t.Errorf("got %q, want %q", out, want)
+		}
+	})
+}
+
+func TestEdit_RefusesBinaryAndUTF16(t *testing.T) {
+	const wantErr = "refusing to edit a binary or UTF-16 file; use runner_shell"
+	late := append(bytes.Repeat([]byte("a"), binarySniffLen+10), 0)
+	cases := []struct {
+		name    string
+		content []byte
+		refused bool
+	}{
+		{"NUL in first bytes", []byte("abc\x00def abc"), true},
+		{"UTF-16LE BOM", []byte{0xFF, 0xFE, 'a', 0, ' ', 0, 'a', 0}, true},
+		{"UTF-16BE BOM", []byte{0xFE, 0xFF, 0, 'a', 0, ' ', 0, 'a'}, true},
+		{"NUL only after sniff window", late, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops, root, cleanup := newTestOps(t)
+			defer cleanup()
+			p := writeRaw(t, root, "b.bin", tc.content)
+
+			_, err1 := ops.StrReplace(p, "a", "z")
+			_, err2 := ops.Insert(p, 0, "z")
+			if tc.refused {
+				for i, err := range []error{err1, err2} {
+					if err == nil || err.Error() != wantErr {
+						t.Errorf("op %d: got %v, want %q", i, err, wantErr)
+					}
+				}
+				if got := readRaw(t, p); !bytes.Equal(got, tc.content) {
+					t.Errorf("bytes changed: %q", got)
+				}
+				// create over it is still allowed
+				if err := ops.WriteFile(p, "text\n"); err != nil {
+					t.Errorf("create over binary must be allowed: %v", err)
+				}
+				if got := string(readRaw(t, p)); got != "text\n" {
+					t.Errorf("create over binary: got %q", got)
+				}
+			} else if err1 != nil && err1.Error() == wantErr {
+				t.Error("NUL beyond the sniff window must not trigger refusal")
+			}
+		})
+	}
+}
+
+func TestStrReplace_EmptyOldStrRejected(t *testing.T) {
+	for _, content := range []string{"", "some\ncontent\n"} {
+		ops, root, cleanup := newTestOps(t)
+		p := writeRaw(t, root, "f.txt", []byte(content))
+		_, err := ops.StrReplace(p, "", "x")
+		if err == nil || err.Error() != "old_str must not be empty" {
+			t.Errorf("content %q: got %v", content, err)
+		}
+		if got := string(readRaw(t, p)); got != content {
+			t.Errorf("file modified: %q", got)
+		}
+		cleanup()
+	}
+}
+
+func TestOps_RelativePathRejected(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+	writeRaw(t, root, "foo.txt", []byte("a\n"))
+
+	for _, rel := range []string{"foo.txt", ".\\foo.txt", "./foo.txt", "sub/foo.txt"} {
+		want := "path must be absolute: " + rel
+		check := func(op string, err error) {
+			if err == nil || err.Error() != want {
+				t.Errorf("%s(%q): got %v, want %q", op, rel, err, want)
+			}
+		}
+		_, err := ops.ReadFile(rel, nil)
+		check("view", err)
+		check("create", ops.WriteFile(rel, "x"))
+		_, err = ops.StrReplace(rel, "a", "b")
+		check("str_replace", err)
+		_, err = ops.Insert(rel, 0, "b")
+		check("insert", err)
+		check("delete", ops.DeleteFile(rel))
+	}
+	if got := string(readRaw(t, filepath.Join(root, "foo.txt"))); got != "a\n" {
+		t.Errorf("file modified: %q", got)
+	}
+	// Absolute path inside the root still works.
+	if _, err := ops.ReadFile(filepath.Join(root, "foo.txt"), nil); err != nil {
+		t.Errorf("absolute path inside root rejected: %v", err)
+	}
+}
+
+func TestReadFile_ViewRangeValidation(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+	p := writeRaw(t, root, "r.txt", []byte("a\nb\nc\nd\n"))
+
+	_, err := ops.ReadFile(p, []int{30, 10})
+	if want := "invalid view_range: start 30 is after end 10"; err == nil || err.Error() != want {
+		t.Errorf("got %v, want %q", err, want)
+	}
+	_, err = ops.ReadFile(p, []int{3, 2})
+	if want := "invalid view_range: start 3 is after end 2"; err == nil || err.Error() != want {
+		t.Errorf("got %v, want %q", err, want)
+	}
+	out, err := ops.ReadFile(p, []int{0, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "1: a\n2: b\n"; out != want {
+		t.Errorf("[0,2]: got %q, want %q", out, want)
+	}
+	// An end of -1 still means "to the end".
+	out, err = ops.ReadFile(p, []int{3, -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "3: c\n4: d\n"; out != want {
+		t.Errorf("[3,-1]: got %q, want %q", out, want)
+	}
+}
+
+func TestReadFile_ClipNeverSplitsRune(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	// Output is "1: " + content + "\n". Put the 3-byte "€" so that it starts at
+	// byte 499999 and straddles the 500000-byte limit.
+	content := strings.Repeat("a", 499_999-len("1: ")) + "€€€€"
+	p := writeRaw(t, root, "big.txt", []byte(content))
+	out, err := ops.ReadFile(p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(out) {
+		t.Error("clipped output is not valid UTF-8")
+	}
+	if !strings.HasSuffix(out, "\n<response clipped>") {
+		t.Errorf("missing clip marker: %q", out[len(out)-30:])
+	}
+	if strings.Contains(out, "€") {
+		t.Error("the straddling rune should have been dropped, not kept partially")
+	}
+}
+
+func TestGuardPath_CaseInsensitiveOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows only")
+	}
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	p := writeRaw(t, root, "Case.txt", []byte("a\r\n"))
+	upper := strings.ToUpper(p)
+	if upper == p {
+		t.Skip("path has no letters to re-case")
+	}
+	if _, err := ops.guardPath(upper); err != nil {
+		t.Errorf("upper-cased spelling rejected: %v", err)
+	}
+	if _, err := ops.guardPath(strings.ToLower(p)); err != nil {
+		t.Errorf("lower-cased spelling rejected: %v", err)
+	}
+	if _, err := ops.StrReplace(upper, "a", "b"); err != nil {
+		t.Errorf("StrReplace via upper-cased path: %v", err)
+	}
+	// Outside paths are still rejected.
+	if _, err := ops.guardPath(filepath.Dir(root)); err == nil {
+		t.Error("parent of root must still be rejected")
+	}
+	if _, err := ops.guardPath(root + "-sibling"); err == nil {
+		t.Error("sibling sharing the root prefix must still be rejected")
+	}
+
+	// Both spellings must share one lock.
+	if lockKey(p) != lockKey(upper) {
+		t.Fatalf("lock keys differ: %q vs %q", lockKey(p), lockKey(upper))
+	}
+	release := ops.lockPath(p)
+	acquired := make(chan struct{})
+	go func() {
+		r := ops.lockPath(upper)
+		close(acquired)
+		r()
+	}()
+	select {
+	case <-acquired:
+		t.Error("second spelling acquired a different lock while the first was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-acquired:
+	case <-time.After(5 * time.Second):
+		t.Error("second spelling never acquired the lock after release")
+	}
+}
+
+func TestLockPath_MapReleasedWhenUnused(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	for i := 0; i < 200; i++ {
+		release := ops.lockPath(filepath.Join(root, fmt.Sprintf("f%d.txt", i)))
+		release()
+	}
+	ops.mu.Lock()
+	n := len(ops.pathLocks)
+	ops.mu.Unlock()
+	if n != 0 {
+		t.Errorf("lock map has %d entries after all locks released, want 0", n)
+	}
+
+	// Held lock keeps its entry; contended use still ends at zero.
+	p := filepath.Join(root, "shared.txt")
+	release := ops.lockPath(p)
+	ops.mu.Lock()
+	held := len(ops.pathLocks)
+	ops.mu.Unlock()
+	if held != 1 {
+		t.Errorf("held lock: map has %d entries, want 1", held)
+	}
+	release()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ops.lockPath(p)()
+		}()
+	}
+	wg.Wait()
+	ops.mu.Lock()
+	n = len(ops.pathLocks)
+	ops.mu.Unlock()
+	if n != 0 {
+		t.Errorf("lock map has %d entries after contended use, want 0", n)
+	}
+}
+
+func TestCreate_ReportsOverwritten(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	p := filepath.Join(root, "n.txt")
+	over, err := ops.Create(p, "a\n")
+	if err != nil || over {
+		t.Errorf("new file: overwritten=%v err=%v, want false/nil", over, err)
+	}
+	over, err = ops.Create(p, "b\n")
+	if err != nil || !over {
+		t.Errorf("existing file: overwritten=%v err=%v, want true/nil", over, err)
+	}
+}
+
+func TestWriteFile_OverExisting_DoesNotPreserveFinalNewline(t *testing.T) {
+	ops, root, cleanup := newTestOps(t)
+	defer cleanup()
+
+	p := writeRaw(t, root, "f.txt", []byte("old\r\nfile\r\n"))
+	if err := ops.WriteFile(p, "new\nbody"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(readRaw(t, p)), "new\r\nbody"; got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }

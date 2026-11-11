@@ -1,4 +1,4 @@
-﻿// Package runner implements the main command dispatch loop.
+// Package runner implements the main command dispatch loop.
 // It reads RawCommand messages from the WebSocket client, routes them to the
 // appropriate executor, and writes back result/stream/done/error responses.
 package runner
@@ -120,9 +120,14 @@ func (r *Runner) handleFileOp(cmdID string, raw protocol.RawCommand, send func(i
 
 	case "create":
 		content, _ := raw["file_text"].(string)
-		err = r.fileOps.WriteFile(path, content)
+		overwritten, werr := r.fileOps.Create(path, content)
+		err = werr
 		if err == nil {
-			data = fmt.Sprintf("File created successfully: %s", path)
+			if overwritten {
+				data = "File overwritten successfully"
+			} else {
+				data = fmt.Sprintf("File created successfully: %s", path)
+			}
 		}
 
 	case "str_replace":
