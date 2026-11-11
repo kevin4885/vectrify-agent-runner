@@ -208,6 +208,7 @@ func (m *ProcessManager) Start(id, command, workingDir string) (ProcessInfo, err
 	shellName, shellArgs, cleanupCmdFile := shellInvocation(command)
 	c := exec.Command(shellName, shellArgs...)
 	c.Dir = workingDir
+	c.Env = shellEnv()
 	c.Stdout = logFile
 	c.Stderr = logFile
 

@@ -151,6 +151,7 @@ func (s *Shell) Run(
 	defer cleanupCmdFile()
 	c := exec.CommandContext(ctx, shellName, shellArgs...)
 	c.Dir = workingDir
+	c.Env = shellEnv()
 
 	// Defence-in-depth backstop for the process itself: if ctx is done and
 	// the direct child fails to exit promptly after Cancel (default:

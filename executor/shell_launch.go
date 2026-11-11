@@ -76,20 +76,54 @@ const winLocationSync = "foreach ($__n in 'Set-Location','Push-Location','Pop-Lo
 	"Set-Item -Path ('Function:\\global:' + $__n) -Value ([scriptblock]::Create($__b)) } catch {} }; " +
 	"Remove-Variable __n,__c,__b -ErrorAction SilentlyContinue; "
 
+// winHostWidth widens the host buffer. In a redirected, non-interactive
+// session the host reports a 99-column buffer, and the formatting cmdlets
+// (Select-String match display, Format-Table, error records) hard-wrap at
+// it. Guarded: if the host refuses, the command still runs, just wrapped.
+// Contains no double quotes (see the file comment).
+const winHostWidth = "try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(4096, 3000) } catch {}; "
+
 // winPreamble is everything that runs before the user's command.
-const winPreamble = winUTF8Preamble + winReadDefaults + winLocationSync
+const winPreamble = winUTF8Preamble + winHostWidth + winReadDefaults + winLocationSync
 
 // winBootstrapFmt reads the command file (%s = path, single-quote escaped),
 // deletes it, then dot-sources the text. The trailing `;$global:... = $?`
 // appended to the script text records whether the user's LAST statement
 // succeeded, and the final `if` turns that into exit code 1 — exactly what
 // `powershell -Command` does natively.
+//
+// Only the [scriptblock]::Create call is wrapped in try/catch. A parse
+// error in the user's text would otherwise surface as "Exception calling
+// Create ..." followed by a second error block pointing into this
+// bootstrap. The catch prints just the parser's own message (the inner
+// ParseException, whose positions are relative to the user's text) to
+// stderr and exits 1; nothing from the user's command has run. Runtime
+// errors are not caught here, so they behave exactly as before.
 const winBootstrapFmt = "$__vecF = '%s'; " +
 	"$__vecT = [IO.File]::ReadAllText($__vecF, [Text.Encoding]::UTF8); " +
 	"Remove-Item -LiteralPath $__vecF -Force -ErrorAction SilentlyContinue; " +
 	"$global:__vecOk = $true; " +
-	". ([scriptblock]::Create($__vecT + [char]10 + ';$global:__vecOk = $?')); " +
+	"try { $__vecS = [scriptblock]::Create($__vecT + [char]10 + ';$global:__vecOk = $?') } " +
+	"catch { $__vecE = $_.Exception; if ($__vecE.InnerException) { $__vecE = $__vecE.InnerException }; " +
+	"[Console]::Error.WriteLine($__vecE.Message); exit 1 }; " +
+	". $__vecS; " +
 	"if (-not $global:__vecOk) { exit 1 }"
+
+// shellEnv is the environment for every shell / process child: the runner's
+// own environment (unchanged) plus NO_COLOR=1, so CLIs that honour it do not
+// emit ANSI colour into captured output. If NO_COLOR is already defined —
+// even set to empty — the user's value wins. Keys compare case-insensitively
+// (Windows environment names are case-insensitive). FORCE_COLOR is
+// deliberately never set: some tools treat any value as "force colour on".
+func shellEnv() []string {
+	env := os.Environ()
+	for _, kv := range env {
+		if key, _, _ := strings.Cut(kv, "="); strings.EqualFold(key, "NO_COLOR") {
+			return env
+		}
+	}
+	return append(env, "NO_COLOR=1")
+}
 
 // scriptFilePrefix / staleScriptAge: command files are normally deleted by
 // the bootstrap within milliseconds. A file only survives if powershell was

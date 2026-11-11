@@ -3,6 +3,7 @@ package executor
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -353,5 +354,278 @@ func TestProcessManager_Windows_UsesSameLauncher(t *testing.T) {
 	}
 	if !strings.Contains(logs, `say "hi" \" there`) {
 		t.Errorf("quoting mangled under runner_process: %q", logs)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Width, colour environment, parse-error reporting
+// ─────────────────────────────────────────────────────────────────────────────
+
+// runShellStreams is runShell with stdout and stderr kept apart.
+func runShellStreams(t *testing.T, cmd, dir string) (stdout, stderr string, code int) {
+	t.Helper()
+	s, _ := newTestShell(t)
+	chunks, res, _, got := runBounded(t, s, cmd, dir, 30, 40*time.Second)
+	if !got {
+		t.Fatalf("no result for %q", cmd)
+	}
+	var so, se strings.Builder
+	for _, c := range chunks {
+		if c.Stream == "stderr" {
+			se.WriteString(c.Data)
+		} else {
+			so.WriteString(c.Data)
+		}
+	}
+	return so.String(), se.String(), res.ExitCode
+}
+
+func longestLine(s string) int {
+	longest := 0
+	for _, l := range strings.Split(strings.ReplaceAll(s, "\r", ""), "\n") {
+		if len(l) > longest {
+			longest = len(l)
+		}
+	}
+	return longest
+}
+
+// unsetenv removes key for the duration of the test (t.Setenv registers the
+// restore of the original value; the Unsetenv then clears it).
+func unsetenv(t *testing.T, key string) {
+	t.Helper()
+	t.Setenv(key, "")
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShellEnv_NoColorRules(t *testing.T) {
+	count := func(env []string) (n int, val string) {
+		for _, kv := range env {
+			if k, v, ok := strings.Cut(kv, "="); ok && strings.EqualFold(k, "NO_COLOR") {
+				n++
+				val = v
+			}
+		}
+		return
+	}
+	t.Run("unset adds NO_COLOR=1", func(t *testing.T) {
+		unsetenv(t, "NO_COLOR")
+		env := shellEnv()
+		if n, v := count(env); n != 1 || v != "1" {
+			t.Errorf("NO_COLOR entries=%d value=%q, want 1 entry of 1", n, v)
+		}
+	})
+	t.Run("user value wins", func(t *testing.T) {
+		t.Setenv("NO_COLOR", "custom")
+		if n, v := count(shellEnv()); n != 1 || v != "custom" {
+			t.Errorf("NO_COLOR entries=%d value=%q, want 1 entry of custom", n, v)
+		}
+	})
+	t.Run("set to empty counts as defined", func(t *testing.T) {
+		t.Setenv("NO_COLOR", "")
+		if n, v := count(shellEnv()); n != 1 || v != "" {
+			t.Errorf("NO_COLOR entries=%d value=%q, want 1 empty entry", n, v)
+		}
+	})
+	t.Run("key case is ignored on Windows", func(t *testing.T) {
+		if runtime.GOOS != "windows" {
+			t.Skip("environment names are case-insensitive only on Windows")
+		}
+		unsetenv(t, "NO_COLOR")
+		t.Setenv("No_Color", "mixed")
+		if n, v := count(shellEnv()); n != 1 || v != "mixed" {
+			t.Errorf("NO_COLOR entries=%d value=%q, want 1 entry of mixed", n, v)
+		}
+	})
+	t.Run("inherited env is preserved and FORCE_COLOR untouched", func(t *testing.T) {
+		unsetenv(t, "NO_COLOR")
+		unsetenv(t, "FORCE_COLOR")
+		t.Setenv("VEC_P2_MARKER", "keepme")
+		env := shellEnv()
+		want := len(os.Environ()) + 1
+		if len(env) != want {
+			t.Errorf("len(env) = %d, want %d (inherited + NO_COLOR)", len(env), want)
+		}
+		found := false
+		for _, kv := range env {
+			if kv == "VEC_P2_MARKER=keepme" {
+				found = true
+			}
+			if strings.HasPrefix(strings.ToUpper(kv), "FORCE_COLOR=") {
+				t.Errorf("FORCE_COLOR must never be set: %q", kv)
+			}
+		}
+		if !found {
+			t.Error("inherited variable missing from shellEnv()")
+		}
+	})
+}
+
+func TestWinLauncher_NoDoubleQuotes(t *testing.T) {
+	if strings.Contains(winBootstrapFmt, `"`) {
+		t.Errorf("winBootstrapFmt contains a double quote: %q", winBootstrapFmt)
+	}
+	if strings.Contains(winPreamble, `"`) {
+		t.Errorf("winPreamble contains a double quote: %q", winPreamble)
+	}
+}
+
+func TestWinPreamble_WidthIsTryCatchGuarded(t *testing.T) {
+	const assign = "$Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(4096, 3000)"
+	if !strings.Contains(winPreamble, "try { "+assign+" } catch {}") {
+		t.Errorf("buffer assignment is not wrapped in try { } catch {}: %q", winPreamble)
+	}
+	// Both launch paths carry the preamble, so both get the width.
+	_, args, cleanup := buildShellInvocation("windows", "'x'", t.TempDir())
+	defer cleanup()
+	if !strings.Contains(args[len(args)-1], assign) {
+		t.Errorf("file-based bootstrap lacks the width setting: %q", args[len(args)-1])
+	}
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, args, cleanup2 := buildShellInvocation("windows", "'x'", filepath.Join(blocker, "sub"))
+	defer cleanup2()
+	if !strings.Contains(args[len(args)-1], assign) {
+		t.Errorf("inline-fallback args lack the width setting: %q", args[len(args)-1])
+	}
+}
+
+func TestShellRun_Windows_OutputNotWrappedAtHostWidth(t *testing.T) {
+	skipIfNotWindows(t)
+	t.Parallel()
+	dir := t.TempDir()
+
+	out, code := runShell(t, `(('a' * 100) + ' FAILED ' + ('b' * 192)) | Select-String FAILED`, dir)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	if n := longestLine(out); n < 300 {
+		t.Errorf("Select-String match was wrapped: longest line %d, want >= 300:\n%s", n, out)
+	}
+
+	out, code = runShell(t, `[pscustomobject]@{ Col = ('z' * 250) } | Format-Table`, dir)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	if n := longestLine(out); n < 250 {
+		t.Errorf("Format-Table was wrapped/truncated: longest line %d, want >= 250:\n%s", n, out)
+	}
+}
+
+func TestShellRun_Windows_FollowingCommandRunsWhenWidthCannotBeSet(t *testing.T) {
+	skipIfNotWindows(t)
+	t.Parallel()
+	// Same guard text as the preamble, but with an assignment that throws:
+	// proves a failing buffer set does not stop what follows.
+	out, code := runShell(t, `try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(-1, -1) } catch {}; Write-Output 'still-ran'`, t.TempDir())
+	if code != 0 || !strings.Contains(out, "still-ran") {
+		t.Errorf("command after a failed width set did not run: code=%d out=%q", code, out)
+	}
+}
+
+func TestShellRun_Windows_NoColorEnvReachesChild(t *testing.T) {
+	skipIfNotWindows(t)
+	// Not parallel: changes the process environment.
+	dir := t.TempDir()
+	probe := `'NC=[' + $env:NO_COLOR + '] FC=[' + $env:FORCE_COLOR + ']'`
+
+	unsetenv(t, "NO_COLOR")
+	unsetenv(t, "FORCE_COLOR")
+	out, code := runShell(t, probe, dir)
+	if code != 0 || !strings.Contains(out, "NC=[1] FC=[]") {
+		t.Errorf("unset: code=%d out=%q, want NC=[1] FC=[]", code, out)
+	}
+
+	t.Setenv("NO_COLOR", "custom")
+	out, code = runShell(t, probe, dir)
+	if code != 0 || !strings.Contains(out, "NC=[custom] FC=[]") {
+		t.Errorf("custom: code=%d out=%q, want NC=[custom] FC=[]", code, out)
+	}
+}
+
+func TestShellRun_Windows_ParseErrorReportsOnlyParserMessage(t *testing.T) {
+	skipIfNotWindows(t)
+	t.Parallel()
+	stdout, stderr, code := runShellStreams(t, `$x = 1; if ($x -eq 1 { "bad" }`, t.TempDir())
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1 (stderr %q)", code, stderr)
+	}
+	for _, want := range []string{"Unexpected token '{'", "char:22"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr lacks %q: %q", want, stderr)
+		}
+	}
+	low := strings.ToLower(stderr)
+	for _, bad := range []string{"exception calling", "parseexception", "scriptblock", "__vec"} {
+		if strings.Contains(low, bad) {
+			t.Errorf("stderr leaks launcher internals (%q): %q", bad, stderr)
+		}
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("stdout should be empty, got %q", stdout)
+	}
+}
+
+func TestShellRun_Windows_ParseErrorRunsNothingAndKeepsUserLineNumbers(t *testing.T) {
+	skipIfNotWindows(t)
+	t.Parallel()
+	dir := t.TempDir()
+
+	stdout, _, code := runShellStreams(t, `Write-Output before; if ( {`, dir)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if strings.Contains(stdout, "before") {
+		t.Errorf("statement before the syntax error must not run: %q", stdout)
+	}
+
+	_, stderr, code := runShellStreams(t, "Write-Output one\nWrite-Output two\nif ( {\nWrite-Output four", dir)
+	if code != 1 {
+		t.Errorf("multi-line: exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "At line:3") {
+		t.Errorf("multi-line parse error should report line 3 of the user's command: %q", stderr)
+	}
+}
+
+func TestShellRun_Windows_RuntimeErrorsUnchangedByParseGuard(t *testing.T) {
+	skipIfNotWindows(t)
+	t.Parallel()
+	dir := t.TempDir()
+
+	_, stderr, code := runShellStreams(t, `throw "boom"`, dir)
+	if code != 1 || !strings.Contains(stderr, "boom") {
+		t.Errorf("throw: code=%d stderr=%q, want 1 + boom", code, stderr)
+	}
+	if _, _, code := runShellStreams(t, `exit 7`, dir); code != 7 {
+		t.Errorf("exit 7: code = %d", code)
+	}
+	if _, _, code := runShellStreams(t, `Get-Item C:\does-not-exist`, dir); code != 1 {
+		t.Errorf("failing last statement: code = %d, want 1", code)
+	}
+	if _, _, code := runShellStreams(t, `'ok'`, dir); code != 0 {
+		t.Errorf("success: code = %d, want 0", code)
+	}
+}
+
+func TestProcessManager_Windows_ChildGetsNoColor(t *testing.T) {
+	skipIfNotWindows(t)
+	// Not parallel: changes the process environment.
+	unsetenv(t, "NO_COLOR")
+	m, dir := newTestProcessManager(t, 5, time.Hour)
+	if _, err := m.Start("nc", `Write-Output ('NC=[' + $env:NO_COLOR + ']'); Start-Sleep -Seconds 30`, dir); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	logs, err := m.Logs("nc", 0)
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	if !strings.Contains(logs, "NC=[1]") {
+		t.Errorf("runner_process child did not get NO_COLOR=1: %q", logs)
 	}
 }
