@@ -32,6 +32,7 @@ package executor
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -39,6 +40,21 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+)
+
+const (
+	// processLogPrefix / processLogSuffix mark every log file this runner
+	// creates. The startup sweep deletes ONLY regular files that carry both,
+	// directly inside the runner's own log directory — never anything else.
+	processLogPrefix = "vectrify-proc-"
+	processLogSuffix = ".log"
+
+	// processLogCloseWait bounds how long Stop/Shutdown/the reaper wait for a
+	// killed process's log file to be closed (by waitForExit) before it can
+	// be deleted. If it is not closed in time, deletion happens in the
+	// background as soon as it is.
+	processLogCloseWait = 5 * time.Second
 )
 
 // managedProcess tracks one detached process this runner started.
@@ -53,6 +69,10 @@ type managedProcess struct {
 	tree    procTreeIface
 	logFile *os.File
 	logPath string
+	// closed is closed by waitForExit once the process has exited AND
+	// logFile has been closed — the earliest moment logPath can be deleted
+	// (Windows refuses to delete a file that is still open).
+	closed chan struct{}
 
 	mu       sync.Mutex
 	exited   bool
@@ -103,6 +123,40 @@ func (p *managedProcess) lastActivity() time.Time {
 	return p.startedAt
 }
 
+// removeLog deletes the log file this manager created for p (exact path
+// held in p.logPath — never a wildcard) once waitForExit has closed it,
+// waiting until deadline for that. If the file is still open at the
+// deadline, deletion is finished in the background so it is never leaked.
+func (p *managedProcess) removeLog(deadline time.Time) {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-p.closed:
+		_ = os.Remove(p.logPath) // best-effort; a leaked temp log file is not worth failing over
+	case <-timer.C:
+		go func() {
+			<-p.closed
+			_ = os.Remove(p.logPath)
+		}()
+	}
+}
+
+// killTree terminates p's process tree (or just the direct child when no
+// tree tracker is available).
+func (p *managedProcess) killTree() {
+	if p.tree != nil {
+		p.tree.kill()
+		p.tree.release()
+	} else {
+		// No tree tracker (newProcTreeFn failed at Start time) — fall back
+		// to killing just the direct child. Descendants, if any, are not
+		// tracked and may survive; this mirrors the same documented,
+		// narrow limitation shell.go accepts for the analogous failure
+		// path (see shell.go's "tree tracker" warning log).
+		_ = p.cmd.Process.Kill()
+	}
+}
+
 // ProcessManager owns a small pool of long-lived, detached processes keyed
 // by a caller-supplied process_id. One ProcessManager is created per Runner
 // (see runner.New) and lives for the process lifetime.
@@ -137,8 +191,36 @@ func NewProcessManager(workspaceRoot string, maxProcesses int, maxAge time.Durat
 		processes:     make(map[string]*managedProcess),
 		stopReaper:    make(chan struct{}),
 	}
+	sweepStaleProcessLogs(processLogDir(), maxAge)
 	m.reaperOnce.Do(func() { go m.reapLoop() })
 	return m
+}
+
+// sweepStaleProcessLogs removes leftover log files from earlier runner runs
+// (a crash or kill -9 skips Stop/Shutdown): regular files directly inside
+// dir — no recursion, symlinks are never followed or removed — whose name
+// carries this runner's log prefix/suffix and whose mtime is older than
+// maxAge. Nothing else in dir is ever touched. A missing dir is not an error.
+func sweepStaleProcessLogs(dir string, maxAge time.Duration) {
+	if maxAge <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, e := range entries {
+		name := e.Name()
+		if !e.Type().IsRegular() || !strings.HasPrefix(name, processLogPrefix) || !strings.HasSuffix(name, processLogSuffix) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, name))
+	}
 }
 
 // processLogDir returns the directory detached-process log files are
@@ -186,17 +268,14 @@ func (m *ProcessManager) Start(id, command, workingDir string) (ProcessInfo, err
 	}
 	if len(m.processes) >= m.maxProcesses {
 		m.mu.Unlock()
-		return ProcessInfo{}, fmt.Errorf(
-			"background process limit reached (max_background_processes=%d); stop an existing process_id before starting another",
-			m.maxProcesses,
-		)
+		return ProcessInfo{}, m.limitError()
 	}
 	m.mu.Unlock()
 
 	if err := os.MkdirAll(processLogDir(), 0755); err != nil {
 		return ProcessInfo{}, fmt.Errorf("creating process log directory: %w", err)
 	}
-	logPath := filepath.Join(processLogDir(), fmt.Sprintf("%s-%d.log", sanitizeForFilename(id), time.Now().UnixNano()))
+	logPath := filepath.Join(processLogDir(), fmt.Sprintf("%s%s-%d%s", processLogPrefix, sanitizeForFilename(id), time.Now().UnixNano(), processLogSuffix))
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return ProcessInfo{}, fmt.Errorf("creating log file: %w", err)
@@ -247,25 +326,35 @@ func (m *ProcessManager) Start(id, command, workingDir string) (ProcessInfo, err
 		tree:       tree,
 		logFile:    logFile,
 		logPath:    logPath,
+		closed:     make(chan struct{}),
 	}
 
-	m.mu.Lock()
-	// Re-check under the lock: another Start(id) could have raced us
-	// between the earlier check and here. Extremely unlikely in practice
-	// (the LLM issues one tool call at a time in the common case), but
-	// cheap to guard properly rather than assume.
-	if _, exists := m.processes[id]; exists {
-		m.mu.Unlock()
-		if tree != nil {
-			tree.kill()
-			tree.release()
-		}
-		logFile.Close()
-		os.Remove(logPath)
-		return ProcessInfo{}, fmt.Errorf("process_id %q is already in use; stop it first or choose a different process_id", id)
+	if processBeforeRegisterHook != nil {
+		processBeforeRegisterHook()
 	}
-	m.processes[id] = mp
+	m.mu.Lock()
+	// Re-check under the lock: the checks above ran before the (slow)
+	// launch, so concurrent Starts can all have passed them. The duplicate
+	// id, shutdown and max_background_processes checks are therefore
+	// enforced again here, atomically with the insertion. A process that
+	// loses any of them was already launched, so it must be killed AND
+	// waited on (nobody else will ever Wait on it) and its log removed.
+	var rejected error
+	switch {
+	case m.processes[id] != nil:
+		rejected = fmt.Errorf("process_id %q is already in use; stop it first or choose a different process_id", id)
+	case m.shuttingDown:
+		rejected = fmt.Errorf("runner is shutting down")
+	case len(m.processes) >= m.maxProcesses:
+		rejected = m.limitError()
+	default:
+		m.processes[id] = mp
+	}
 	m.mu.Unlock()
+	if rejected != nil {
+		discardUnregistered(mp, cleanupCmdFile)
+		return ProcessInfo{}, rejected
+	}
 
 	go m.waitForExit(mp)
 
@@ -320,6 +409,48 @@ func (m *ProcessManager) waitForExit(mp *managedProcess) {
 	mp.mu.Unlock()
 
 	mp.logFile.Close()
+	close(mp.closed)
+}
+
+// limitError is the error returned when the pool is full. The message is
+// part of the tool contract; both the early check and the atomic check at
+// insertion in Start return it.
+func (m *ProcessManager) limitError() error {
+	return fmt.Errorf(
+		"background process limit reached (max_background_processes=%d); stop an existing process_id before starting another",
+		m.maxProcesses,
+	)
+}
+
+// processBeforeRegisterHook, when non-nil, runs in Start after the process
+// has been launched and just before it is registered in the pool. Tests only
+// (to hold several launched Starts at the same point and make the
+// duplicate-id / limit races deterministic); nil in production.
+var processBeforeRegisterHook func()
+
+// processDiscardedHook, when non-nil, is called with the (already killed and
+// waited-on) command of every process discardUnregistered disposes of. Tests
+// only; nil in production.
+var processDiscardedHook func(*exec.Cmd)
+
+// discardUnregistered disposes of a process that was launched but never
+// entered the pool (it lost the duplicate-id / limit / shutdown race). No
+// waitForExit goroutine exists for it, so it is killed and Wait()ed here —
+// otherwise it would leak (a zombie on Unix, an open handle on Windows).
+// cmd.Process.Kill is called in addition to the tree kill because the tree
+// tracker may have failed to attach.
+func discardUnregistered(mp *managedProcess, cleanupCmdFile func()) {
+	mp.killTree()
+	_ = mp.cmd.Process.Kill()
+	_ = mp.cmd.Wait()
+	if processDiscardedHook != nil {
+		processDiscardedHook(mp.cmd)
+	}
+	mp.logFile.Close()
+	_ = os.Remove(mp.logPath)
+	// The process is dead, so the staged command file (if its bootstrap never
+	// got to delete it) can safely be removed now.
+	cleanupCmdFile()
 }
 
 // Stop kills the process (its whole tree, if the tracker attached
@@ -342,17 +473,10 @@ func (m *ProcessManager) Stop(id string) bool {
 	if !ok {
 		return false
 	}
-	if mp.tree != nil {
-		mp.tree.kill()
-		mp.tree.release()
-	} else {
-		// No tree tracker (newProcTreeFn failed at Start time) — fall back
-		// to killing just the direct child. Descendants, if any, are not
-		// tracked and may survive; this mirrors the same documented,
-		// narrow limitation shell.go accepts for the analogous failure
-		// path (see shell.go's "tree tracker" warning log).
-		_ = mp.cmd.Process.Kill()
-	}
+	mp.killTree()
+	// waitForExit observes the kill and closes the log file; once it has,
+	// the log is deleted so Stop does not leak one file per process.
+	mp.removeLog(time.Now().Add(processLogCloseWait))
 	return true
 }
 
@@ -389,7 +513,7 @@ func (m *ProcessManager) Logs(id string, tailLines int) (string, error) {
 		return "", fmt.Errorf("no such process_id %q (it may have already been stopped and cleaned up)", id)
 	}
 
-	data, err := os.ReadFile(mp.logPath)
+	data, clipped, err := readLogTail(mp.logPath, maxLogBytes)
 	if err != nil {
 		return "", fmt.Errorf("reading process log: %w", err)
 	}
@@ -405,15 +529,58 @@ func (m *ProcessManager) Logs(id string, tailLines int) (string, error) {
 		trimmed := strings.TrimSuffix(text, "\n")
 		lines := strings.Split(trimmed, "\n")
 		if len(lines) > tailLines {
+			// The first line of a clipped window may be a partial line;
+			// dropping lines here drops it too, so nothing is clipped.
 			lines = lines[len(lines)-tailLines:]
+			clipped = false
 		}
 		text = strings.Join(lines, "\n")
 	}
 
-	if len(text) > maxLogBytes {
-		text = "<earlier output clipped>\n" + text[len(text)-maxLogBytes:]
+	if clipped {
+		text = "<earlier output clipped>\n" + text
 	}
 	return text, nil
+}
+
+// readLogTail returns at most the last maxBytes bytes of the file at path,
+// reading only that window (it seeks; the file is never read whole, however
+// large a runaway process has made it). clipped reports that earlier content
+// was left out. When the window starts mid-file it is advanced past any UTF-8
+// continuation bytes so the result begins on a character boundary (a window
+// that starts inside a multi-byte rune would otherwise decode to U+FFFD).
+func readLogTail(path string, maxBytes int64) (data []byte, clipped bool, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	size := info.Size()
+	start := int64(0)
+	if size > maxBytes {
+		start = size - maxBytes
+		clipped = true
+	}
+	buf := make([]byte, size-start)
+	n, err := f.ReadAt(buf, start)
+	if err != nil && err != io.EOF {
+		return nil, false, err
+	}
+	buf = buf[:n]
+	if clipped {
+		// A UTF-8 rune is at most 4 bytes, so at most 3 leading
+		// continuation bytes can belong to a rune that began before start.
+		skip := 0
+		for skip < len(buf) && skip < utf8.UTFMax-1 && !utf8.RuneStart(buf[skip]) {
+			skip++
+		}
+		buf = buf[skip:]
+	}
+	return buf, clipped, nil
 }
 
 // reapLoop periodically reaps processes past m.maxAge — a safety net for a
@@ -464,16 +631,11 @@ func (m *ProcessManager) reapOnce() {
 		if info.Running {
 			m.log.Info("process: reaping process that exceeded max age", "process_id", mp.id, "pid", mp.pid,
 				"age", now.Sub(mp.startedAt).Round(time.Second).String())
-			if mp.tree != nil {
-				mp.tree.kill()
-				mp.tree.release()
-			} else {
-				_ = mp.cmd.Process.Kill()
-			}
+			mp.killTree()
 		} else {
 			m.log.Info("process: cleaning up exited process past max age", "process_id", mp.id, "pid", mp.pid)
 		}
-		_ = os.Remove(mp.logPath) // best-effort; a leaked temp log file is not worth failing over
+		mp.removeLog(time.Now().Add(processLogCloseWait))
 	}
 }
 
@@ -493,13 +655,15 @@ func (m *ProcessManager) Shutdown() {
 		m.mu.Unlock()
 
 		for id, mp := range processes {
-			if mp.tree != nil {
-				mp.tree.kill()
-				mp.tree.release()
-			} else {
-				_ = mp.cmd.Process.Kill()
-			}
+			mp.killTree()
 			m.log.Info("process: killed on runner shutdown", "process_id", id, "pid", mp.pid)
+		}
+		// One shared deadline: all kills were issued above, so the log files
+		// close concurrently and a stuck one cannot stretch shutdown by
+		// processLogCloseWait per process.
+		deadline := time.Now().Add(processLogCloseWait)
+		for _, mp := range processes {
+			mp.removeLog(deadline)
 		}
 	})
 }
