@@ -48,6 +48,7 @@ package executor
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -79,9 +80,23 @@ const winLocationSync = "foreach ($__n in 'Set-Location','Push-Location','Pop-Lo
 // winHostWidth widens the host buffer. In a redirected, non-interactive
 // session the host reports a 99-column buffer, and the formatting cmdlets
 // (Select-String match display, Format-Table, error records) hard-wrap at
-// it. Guarded: if the host refuses, the command still runs, just wrapped.
+// it. 1024 columns is enough to un-wrap those; going wider (4096) made the
+// default table view pad every row to the full width and blew the output
+// cap. Guarded: if the host refuses, the command still runs, just wrapped.
 // Contains no double quotes (see the file comment).
-const winHostWidth = "try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(4096, 3000) } catch {}; "
+const winHostWidth = "try { $Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(1024, 3000) } catch {}; "
+
+// winInlineNote is written to stderr, first, when the command had to be
+// passed inline because the command file could not be staged: quoting and
+// syntax-error positions can differ from the file-based path. Constant,
+// single quotes only, no double quotes (see the file comment).
+//
+// Best-effort: the note is printed when the command parses. On a syntax error
+// PowerShell reports the error before anything runs (it parses the whole
+// -Command string first), so the note is absent in that case; the runner log
+// still carries the warning.
+const winInlineNote = "runner: note: command file could not be staged; command ran inline (quoting and syntax-error positions may differ)"
+const winInlineNoteCmd = "[Console]::Error.WriteLine('" + winInlineNote + "'); "
 
 // winPreamble is everything that runs before the user's command.
 const winPreamble = winUTF8Preamble + winHostWidth + winReadDefaults + winLocationSync
@@ -92,7 +107,12 @@ const winPreamble = winUTF8Preamble + winHostWidth + winReadDefaults + winLocati
 // succeeded, and the final `if` turns that into exit code 1 — exactly what
 // `powershell -Command` does natively.
 //
-// Only the [scriptblock]::Create call is wrapped in try/catch. A parse
+// The file read is wrapped too: if the file is missing or unreadable nothing
+// runs, stderr says so and the exit code is 1 (rather than a silent exit 0,
+// which is what happens when the read error is non-terminating at the
+// top level of a -Command string).
+//
+// The [scriptblock]::Create call is wrapped in try/catch. A parse
 // error in the user's text would otherwise surface as "Exception calling
 // Create ..." followed by a second error block pointing into this
 // bootstrap. The catch prints just the parser's own message (the inner
@@ -100,7 +120,9 @@ const winPreamble = winUTF8Preamble + winHostWidth + winReadDefaults + winLocati
 // stderr and exits 1; nothing from the user's command has run. Runtime
 // errors are not caught here, so they behave exactly as before.
 const winBootstrapFmt = "$__vecF = '%s'; " +
-	"$__vecT = [IO.File]::ReadAllText($__vecF, [Text.Encoding]::UTF8); " +
+	"try { $__vecT = [IO.File]::ReadAllText($__vecF, [Text.Encoding]::UTF8) } " +
+	"catch { $__vecE = $_.Exception; if ($__vecE.InnerException) { $__vecE = $__vecE.InnerException }; " +
+	"[Console]::Error.WriteLine('runner: command file unreadable: ' + $__vecE.Message); exit 1 }; " +
 	"Remove-Item -LiteralPath $__vecF -Force -ErrorAction SilentlyContinue; " +
 	"$global:__vecOk = $true; " +
 	"try { $__vecS = [scriptblock]::Create($__vecT + [char]10 + ';$global:__vecOk = $?') } " +
@@ -145,11 +167,16 @@ var shellScriptDir = func() string {
 // is safe to call after the process has finished. ProcessManager must NOT
 // call it after a successful Start (the file may not have been read yet) —
 // the bootstrap deletes the file itself, and leftovers are swept.
-func shellInvocation(command string) (name string, args []string, cleanup func()) {
-	return buildShellInvocation(runtime.GOOS, command, shellScriptDir())
+//
+// log receives the inline-fallback warning; nil falls back to slog.Default().
+func shellInvocation(command string, log *slog.Logger) (name string, args []string, cleanup func()) {
+	return buildShellInvocation(runtime.GOOS, command, shellScriptDir(), log)
 }
 
-func buildShellInvocation(goos, command, scriptDir string) (string, []string, func()) {
+func buildShellInvocation(goos, command, scriptDir string, log *slog.Logger) (string, []string, func()) {
+	if log == nil {
+		log = slog.Default()
+	}
 	noop := func() {}
 	if goos != "windows" {
 		return "bash", []string{"-c", command}, noop
@@ -161,8 +188,10 @@ func buildShellInvocation(goos, command, scriptDir string) (string, []string, fu
 	if err != nil {
 		// Could not stage the command file (read-only/full temp dir, ...).
 		// Fall back to passing the command inline — the previous behaviour —
-		// rather than failing a command that would have worked.
-		return "powershell", append(base, winPreamble+command), noop
+		// rather than failing a command that would have worked, and say so
+		// on stderr so the agent knows quoting / error positions may differ.
+		log.Warn("shell: could not stage command file; running command inline", "error", err)
+		return "powershell", append(base, winInlineNoteCmd+winPreamble+command), noop
 	}
 
 	bootstrap := winPreamble + fmt.Sprintf(winBootstrapFmt, strings.ReplaceAll(path, "'", "''"))

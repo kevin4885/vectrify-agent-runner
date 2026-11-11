@@ -1,7 +1,12 @@
 package executor
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -14,7 +19,7 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 func TestBuildShellInvocation_Unix_IsBashDashC(t *testing.T) {
-	name, args, cleanup := buildShellInvocation("linux", `echo "hi" 'there'`, t.TempDir())
+	name, args, cleanup := buildShellInvocation("linux", `echo "hi" 'there'`, t.TempDir(), nil)
 	defer cleanup()
 	if name != "bash" || len(args) != 2 || args[0] != "-c" || args[1] != `echo "hi" 'there'` {
 		t.Fatalf("unexpected unix invocation: %q %q", name, args)
@@ -24,7 +29,7 @@ func TestBuildShellInvocation_Unix_IsBashDashC(t *testing.T) {
 func TestBuildShellInvocation_Windows_CommandNeverOnCommandLine(t *testing.T) {
 	dir := t.TempDir()
 	command := "Write-Output 'say \"hi\" \\\" there'; $x = @\"\nq \"w\"\n\"@"
-	name, args, cleanup := buildShellInvocation("windows", command, dir)
+	name, args, cleanup := buildShellInvocation("windows", command, dir, nil)
 	defer cleanup()
 
 	if name != "powershell" {
@@ -59,7 +64,7 @@ func TestBuildShellInvocation_Windows_CommandNeverOnCommandLine(t *testing.T) {
 
 func TestBuildShellInvocation_Windows_CleanupRemovesFileAndIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	_, _, cleanup := buildShellInvocation("windows", "'x'", dir)
+	_, _, cleanup := buildShellInvocation("windows", "'x'", dir, nil)
 	cleanup()
 	cleanup()
 	files, _ := filepath.Glob(filepath.Join(dir, scriptFilePrefix+"*"))
@@ -74,7 +79,7 @@ func TestBuildShellInvocation_Windows_FallsBackToInlineWhenDirUnwritable(t *test
 	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	name, args, cleanup := buildShellInvocation("windows", "Write-Output 'inline'", filepath.Join(blocker, "sub"))
+	name, args, cleanup := buildShellInvocation("windows", "Write-Output 'inline'", filepath.Join(blocker, "sub"), nil)
 	defer cleanup()
 	if name != "powershell" {
 		t.Fatalf("name = %q", name)
@@ -86,7 +91,7 @@ func TestBuildShellInvocation_Windows_FallsBackToInlineWhenDirUnwritable(t *test
 
 func TestBuildShellInvocation_Windows_PathWithSingleQuoteIsEscaped(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "it's here")
-	_, args, cleanup := buildShellInvocation("windows", "'x'", dir)
+	_, args, cleanup := buildShellInvocation("windows", "'x'", dir, nil)
 	defer cleanup()
 	b := args[len(args)-1]
 	if !strings.Contains(b, "it''s here") {
@@ -470,15 +475,21 @@ func TestWinLauncher_NoDoubleQuotes(t *testing.T) {
 	if strings.Contains(winPreamble, `"`) {
 		t.Errorf("winPreamble contains a double quote: %q", winPreamble)
 	}
+	if strings.Contains(winInlineNoteCmd, `"`) {
+		t.Errorf("winInlineNoteCmd contains a double quote: %q", winInlineNoteCmd)
+	}
 }
 
 func TestWinPreamble_WidthIsTryCatchGuarded(t *testing.T) {
-	const assign = "$Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(4096, 3000)"
+	const assign = "$Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(1024, 3000)"
+	if !strings.Contains(winHostWidth, "Size(1024, 3000)") {
+		t.Errorf("width constant is not 1024x3000: %q", winHostWidth)
+	}
 	if !strings.Contains(winPreamble, "try { "+assign+" } catch {}") {
 		t.Errorf("buffer assignment is not wrapped in try { } catch {}: %q", winPreamble)
 	}
 	// Both launch paths carry the preamble, so both get the width.
-	_, args, cleanup := buildShellInvocation("windows", "'x'", t.TempDir())
+	_, args, cleanup := buildShellInvocation("windows", "'x'", t.TempDir(), nil)
 	defer cleanup()
 	if !strings.Contains(args[len(args)-1], assign) {
 		t.Errorf("file-based bootstrap lacks the width setting: %q", args[len(args)-1])
@@ -487,7 +498,7 @@ func TestWinPreamble_WidthIsTryCatchGuarded(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, args, cleanup2 := buildShellInvocation("windows", "'x'", filepath.Join(blocker, "sub"))
+	_, args, cleanup2 := buildShellInvocation("windows", "'x'", filepath.Join(blocker, "sub"), nil)
 	defer cleanup2()
 	if !strings.Contains(args[len(args)-1], assign) {
 		t.Errorf("inline-fallback args lack the width setting: %q", args[len(args)-1])
@@ -628,4 +639,146 @@ func TestProcessManager_Windows_ChildGetsNoColor(t *testing.T) {
 	if !strings.Contains(logs, "NC=[1]") {
 		t.Errorf("runner_process child did not get NO_COLOR=1: %q", logs)
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Round 2: padding regression, unreadable command file, inline-fallback note
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The host width must stay narrow enough that the default table view does not
+// pad every row to the full buffer width (4096 turned a 5-file Get-ChildItem
+// into ~33k characters).
+func TestShellRun_Windows_TableOutputIsNotPadded(t *testing.T) {
+	skipIfNotWindows(t)
+	t.Parallel()
+	dir := t.TempDir()
+
+	out, code := runShell(t, `Get-ChildItem C:\Windows\System32\drivers\etc | Out-String`, dir)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	if len(out) >= 12000 {
+		t.Errorf("directory listing is padded: %d chars, want < 12000", len(out))
+	}
+	if n := longestLine(out); n > 1100 {
+		t.Errorf("longest line is %d chars, want <= 1100", n)
+	}
+
+	out, code = runShell(t, `Get-ChildItem C:\Windows\System32 -File | Select-Object -First 30`, dir)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	if len(out) >= 60000 {
+		t.Errorf("30-file listing is %d chars, want < 60000 (API cap is 100000)", len(out))
+	}
+}
+
+// runInvocation runs a powershell invocation built by buildShellInvocation,
+// keeping stdout and stderr apart.
+func runInvocation(t *testing.T, name string, args []string, dir string) (stdout, stderr string, code int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	c := exec.CommandContext(ctx, name, args...)
+	c.Dir = dir
+	c.Env = shellEnv()
+	var so, se bytes.Buffer
+	c.Stdout, c.Stderr = &so, &se
+	err := c.Run()
+	if err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("run %s: %v", name, err)
+		}
+		code = ee.ExitCode()
+	}
+	return so.String(), se.String(), code
+}
+
+func TestShellRun_Windows_UnreadableCommandFileFailsWithExit1(t *testing.T) {
+	skipIfNotWindows(t)
+	t.Parallel()
+	scripts := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "ran.txt")
+
+	name, args, cleanup := buildShellInvocation("windows", "Set-Content -LiteralPath '"+marker+"' -Value x; Write-Output 'should-not-run'", scripts, nil)
+	defer cleanup()
+	files, _ := filepath.Glob(filepath.Join(scripts, scriptFilePrefix+"*"))
+	if len(files) != 1 {
+		t.Fatalf("expected 1 staged file, found %d", len(files))
+	}
+	if err := os.Remove(files[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runInvocation(t, name, args, t.TempDir())
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1 (stderr %q)", code, stderr)
+	}
+	if !strings.Contains(stderr, "runner: command file unreadable:") {
+		t.Errorf("stderr lacks the unreadable-file message: %q", stderr)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("stdout should be empty, got %q", stdout)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("the command ran even though its file was unreadable")
+	}
+}
+
+// Documents the best-effort nature of the note: with a syntactically valid
+// command the inline fallback prints it on stderr first. (On a syntax error
+// PowerShell reports the error before anything runs, so the note is absent;
+// the runner log still carries the warning.)
+func TestShellRun_Windows_InlineFallbackPrintsNoteAndStillRuns(t *testing.T) {
+	skipIfNotWindows(t)
+	t.Parallel()
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const note = "runner: note: command file could not be staged; command ran inline (quoting and syntax-error positions may differ)"
+
+	name, args, cleanup := buildShellInvocation("windows", "Write-Output 'inline-ran'; exit 4", filepath.Join(blocker, "sub"), nil)
+	defer cleanup()
+	stdout, stderr, code := runInvocation(t, name, args, t.TempDir())
+	if code != 4 {
+		t.Errorf("exit code = %d, want 4 (stderr %q)", code, stderr)
+	}
+	if !strings.HasPrefix(stderr, note+"\r\n") && !strings.HasPrefix(stderr, note+"\n") {
+		t.Errorf("stderr should begin with the note line, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "inline-ran") {
+		t.Errorf("the command's own output is missing: %q", stdout)
+	}
+
+	// The file-based path never prints the note.
+	name, args, cleanup2 := buildShellInvocation("windows", "Write-Output 'file-ran'", t.TempDir(), nil)
+	defer cleanup2()
+	stdout, stderr, code = runInvocation(t, name, args, t.TempDir())
+	if code != 0 || !strings.Contains(stdout, "file-ran") {
+		t.Errorf("file-based run: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if strings.Contains(stderr, "runner: note") {
+		t.Errorf("file-based path printed the inline note: %q", stderr)
+	}
+}
+
+func TestBuildShellInvocation_InlineFallbackWarnsViaGivenLogger(t *testing.T) {
+	t.Parallel()
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	lg := slog.New(slog.NewTextHandler(&buf, nil))
+	_, _, cleanup := buildShellInvocation("windows", "'x'", filepath.Join(blocker, "sub"), lg)
+	defer cleanup()
+	if !strings.Contains(buf.String(), "could not stage command file") {
+		t.Errorf("warning not written to the supplied logger: %q", buf.String())
+	}
+
+	// nil logger must not panic (falls back to slog.Default()).
+	_, _, cleanup2 := buildShellInvocation("windows", "'x'", filepath.Join(blocker, "sub"), nil)
+	defer cleanup2()
 }

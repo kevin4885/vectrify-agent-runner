@@ -147,7 +147,7 @@ func (s *Shell) Run(
 	// command string into a process invocation — on Windows it stages the
 	// command in a temp file so no quoting layer can mangle it. cleanup
 	// removes that file if the bootstrap never got to consume it.
-	shellName, shellArgs, cleanupCmdFile := shellInvocation(cmd)
+	shellName, shellArgs, cleanupCmdFile := shellInvocation(cmd, s.log)
 	defer cleanupCmdFile()
 	c := exec.CommandContext(ctx, shellName, shellArgs...)
 	c.Dir = workingDir

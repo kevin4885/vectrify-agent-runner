@@ -424,7 +424,15 @@ for how this is described to the LLM.
   dot-sources the text. The user's text therefore never goes through Go argv escaping or
   PowerShell's command-line re-parse (which mangled quote/backslash sequences), and there
   is no command-line length limit. If the file cannot be written it falls back to passing
-  the command inline (old behaviour). Leftover files (powershell killed before reading)
+  the command inline (old behaviour); the runner logs a warning and the inline preamble
+  writes `runner: note: command file could not be staged; command ran inline (quoting and
+  syntax-error positions may differ)` as the first stderr line (`winInlineNote`). The note is
+  best-effort: it is printed when the command parses; on a syntax error PowerShell reports the
+  error before anything runs, so the note is absent, and the runner log still carries the
+  warning (logged via the caller's `*slog.Logger`; nil falls back to `slog.Default()`). If the
+  staged file is missing/unreadable when powershell starts, nothing runs, stderr gets
+  `runner: command file unreadable: <message>` and the exit code is 1 (never a silent 0).
+  Leftover files (powershell killed before reading)
   are swept after 1 h.
 - **Why not `-EncodedCommand` / `-File`** (both were tried): `-EncodedCommand` leaks
   `#< CLIXML` blobs onto stderr in PS 5.1 and is capped near 16k chars; `-File` changes
@@ -436,9 +444,10 @@ for how this is described to the LLM.
   `-Encoding` still wins; write-side defaults are deliberately untouched because PS 5.1
   `UTF8` writes a BOM); replaces `Set-/Push-/Pop-Location` with `ProxyCommand`-generated
   proxies that also set `[Environment]::CurrentDirectory`, so relative `[IO.File]::*` paths
-  follow `cd`; and widens the host buffer to 4096x3000 (`winHostWidth`, try/catch-guarded).
+  follow `cd`; and widens the host buffer to 1024x3000 (`winHostWidth`, try/catch-guarded).
   The redirected host otherwise reports 99 columns and hard-wraps `Select-String` matches,
-  `Format-Table` and error records.
+  `Format-Table` and error records. Do not go wider: at 4096 the default table view pads
+  every row to ~4095 chars (a 5-file `Get-ChildItem` became ~33k chars), blowing the API cap.
 - **Parse errors:** only the `[scriptblock]::Create(...)` call is in a `try/catch`. On a
   syntax error nothing of the user's command runs; the catch writes just the inner parser
   message (positions relative to the submitted command, `At line:1` = its first line) to

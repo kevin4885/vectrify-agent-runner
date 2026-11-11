@@ -205,7 +205,7 @@ func (m *ProcessManager) Start(id, command, workingDir string) (ProcessInfo, err
 	// Same launcher as Shell.Run (see shell_launch.go). cleanupCmdFile is
 	// only called on a failed Start: once the process is running its
 	// bootstrap deletes the command file itself, and leftovers are swept.
-	shellName, shellArgs, cleanupCmdFile := shellInvocation(command)
+	shellName, shellArgs, cleanupCmdFile := shellInvocation(command, m.log)
 	c := exec.Command(shellName, shellArgs...)
 	c.Dir = workingDir
 	c.Env = shellEnv()
