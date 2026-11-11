@@ -426,7 +426,10 @@ for how this is described to the LLM.
   is no command-line length limit. If the file cannot be written it falls back to passing
   the command inline (old behaviour); the runner logs a warning and the inline preamble
   writes `runner: note: command file could not be staged; command ran inline (quoting and
-  syntax-error positions may differ)` as the first stderr line (`winInlineNote`). If the
+  syntax-error positions may differ)` as the first stderr line (`winInlineNote`). The note is
+  best-effort: it is printed when the command parses; on a syntax error PowerShell reports the
+  error before anything runs, so the note is absent, and the runner log still carries the
+  warning (logged via the caller's `*slog.Logger`; nil falls back to `slog.Default()`). If the
   staged file is missing/unreadable when powershell starts, nothing runs, stderr gets
   `runner: command file unreadable: <message>` and the exit code is 1 (never a silent 0).
   Leftover files (powershell killed before reading)

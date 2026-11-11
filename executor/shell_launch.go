@@ -90,6 +90,11 @@ const winHostWidth = "try { $Host.UI.RawUI.BufferSize = New-Object System.Manage
 // passed inline because the command file could not be staged: quoting and
 // syntax-error positions can differ from the file-based path. Constant,
 // single quotes only, no double quotes (see the file comment).
+//
+// Best-effort: the note is printed when the command parses. On a syntax error
+// PowerShell reports the error before anything runs (it parses the whole
+// -Command string first), so the note is absent in that case; the runner log
+// still carries the warning.
 const winInlineNote = "runner: note: command file could not be staged; command ran inline (quoting and syntax-error positions may differ)"
 const winInlineNoteCmd = "[Console]::Error.WriteLine('" + winInlineNote + "'); "
 
@@ -162,11 +167,16 @@ var shellScriptDir = func() string {
 // is safe to call after the process has finished. ProcessManager must NOT
 // call it after a successful Start (the file may not have been read yet) —
 // the bootstrap deletes the file itself, and leftovers are swept.
-func shellInvocation(command string) (name string, args []string, cleanup func()) {
-	return buildShellInvocation(runtime.GOOS, command, shellScriptDir())
+//
+// log receives the inline-fallback warning; nil falls back to slog.Default().
+func shellInvocation(command string, log *slog.Logger) (name string, args []string, cleanup func()) {
+	return buildShellInvocation(runtime.GOOS, command, shellScriptDir(), log)
 }
 
-func buildShellInvocation(goos, command, scriptDir string) (string, []string, func()) {
+func buildShellInvocation(goos, command, scriptDir string, log *slog.Logger) (string, []string, func()) {
+	if log == nil {
+		log = slog.Default()
+	}
 	noop := func() {}
 	if goos != "windows" {
 		return "bash", []string{"-c", command}, noop
@@ -180,7 +190,7 @@ func buildShellInvocation(goos, command, scriptDir string) (string, []string, fu
 		// Fall back to passing the command inline — the previous behaviour —
 		// rather than failing a command that would have worked, and say so
 		// on stderr so the agent knows quoting / error positions may differ.
-		slog.Warn("shell: could not stage command file; running command inline", "error", err)
+		log.Warn("shell: could not stage command file; running command inline", "error", err)
 		return "powershell", append(base, winInlineNoteCmd+winPreamble+command), noop
 	}
 
