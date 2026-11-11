@@ -2,13 +2,33 @@
 package executor
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"time"
+	"unicode/utf8"
 )
+
+// renameFile is the final step of an atomic write. It is a variable so tests
+// can inject a failure between the temp-file write and the rename.
+var renameFile = os.Rename
+
+// binarySniffLen is how many leading bytes are scanned for a NUL byte when
+// deciding whether a file is binary.
+const binarySniffLen = 8192
+
+// utf8BOM is the UTF-8 byte order mark.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+// errBinaryEdit is the error str_replace / insert return for a binary or
+// UTF-16 file.
+const errBinaryEdit = "refusing to edit a binary or UTF-16 file; use runner_shell"
 
 // FileOps handles all file system operations for the runner.
 type FileOps struct {
@@ -22,17 +42,41 @@ type FileOps struct {
 	// read the file, compute their edit against that snapshot, and write
 	// back — the second write silently discards the first edit (classic
 	// read-modify-write / TOCTOU race). mu protects the map itself; each
-	// path gets its own *sync.Mutex so unrelated files never contend.
+	// path gets its own reference-counted lock so unrelated files never
+	// contend and entries are dropped once nobody uses them.
 	mu        sync.Mutex
-	pathLocks map[string]*sync.Mutex
+	pathLocks map[string]*pathLock
+}
+
+// pathLock is a reference-counted per-path mutex. refs counts the goroutines
+// that hold or are waiting for it; the map entry is deleted when it drops to
+// zero so the map does not grow with every distinct path ever touched.
+type pathLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 // NewFileOps creates a FileOps scoped to the given workspace root.
 func NewFileOps(workspaceRoot string) *FileOps {
 	return &FileOps{
 		workspaceRoot: filepath.Clean(workspaceRoot),
-		pathLocks:     make(map[string]*sync.Mutex),
+		pathLocks:     make(map[string]*pathLock),
 	}
+}
+
+// foldPath returns s in the form used to compare paths: lower-cased on
+// Windows (case-insensitive file system), unchanged elsewhere.
+func foldPath(s string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(s)
+	}
+	return s
+}
+
+// lockKey is the key of the per-path lock map for a cleaned absolute path.
+// Two spellings of the same Windows path must share one lock.
+func lockKey(path string) string {
+	return foldPath(path)
 }
 
 // lockPath acquires exclusive access to the given cleaned absolute path and
@@ -41,30 +85,46 @@ func NewFileOps(workspaceRoot string) *FileOps {
 // write/delete) so no other goroutine can observe or clobber an in-flight
 // change to the same file.
 func (f *FileOps) lockPath(path string) func() {
+	key := lockKey(path)
 	f.mu.Lock()
-	pl, ok := f.pathLocks[path]
+	pl, ok := f.pathLocks[key]
 	if !ok {
-		pl = &sync.Mutex{}
-		f.pathLocks[path] = pl
+		pl = &pathLock{}
+		f.pathLocks[key] = pl
 	}
+	pl.refs++
 	f.mu.Unlock()
 
-	pl.Lock()
-	return pl.Unlock
+	pl.mu.Lock()
+	return func() {
+		pl.mu.Unlock()
+		f.mu.Lock()
+		pl.refs--
+		if pl.refs == 0 {
+			delete(f.pathLocks, key)
+		}
+		f.mu.Unlock()
+	}
 }
 
-// guardPath validates that path is inside the workspace root.
-// Returns the clean absolute path or an error.
+// guardPath validates that path is absolute and inside the workspace root.
+// Returns the clean absolute path or an error. The containment check is
+// purely lexical (symlinks are deliberately not resolved) and is
+// case-insensitive on Windows.
 func (f *FileOps) guardPath(path string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("path is required")
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("path must be absolute: %s", path)
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("invalid path %q: %w", path, err)
 	}
 	clean := filepath.Clean(abs)
-	if clean != f.workspaceRoot && !strings.HasPrefix(clean, f.workspaceRoot+string(filepath.Separator)) {
+	foldClean, foldRoot := foldPath(clean), foldPath(f.workspaceRoot)
+	if foldClean != foldRoot && !strings.HasPrefix(foldClean, foldRoot+string(filepath.Separator)) {
 		return "", fmt.Errorf("path %q is outside the workspace root %q", path, f.workspaceRoot)
 	}
 	return clean, nil
@@ -91,12 +151,20 @@ func (f *FileOps) ReadFile(path string, viewRange []int) (string, error) {
 }
 
 func (f *FileOps) readFileLines(path string, viewRange []int) (string, error) {
+	// An end <= 0 means "to the end of the file", so only a positive end can
+	// be before the start.
+	if len(viewRange) == 2 && viewRange[1] > 0 && viewRange[0] > viewRange[1] {
+		return "", fmt.Errorf("invalid view_range: start %d is after end %d", viewRange[0], viewRange[1])
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("reading file: %w", err)
 	}
 
-	// Normalize CRLF so the LLM always sees clean lines regardless of OS line endings.
+	// Drop a UTF-8 BOM so it is never shown as U+FEFF, and normalize CRLF so
+	// the LLM always sees clean lines regardless of OS line endings.
+	data, _ = stripBOM(data)
 	normalized := strings.ReplaceAll(string(data), "\r\n", "\n")
 	lines := strings.Split(normalized, "\n")
 	// Remove trailing empty line that Split always adds for files ending in \n
@@ -125,7 +193,12 @@ func (f *FileOps) readFileLines(path string, viewRange []int) (string, error) {
 	result := sb.String()
 	const maxBytes = 500_000
 	if len(result) > maxBytes {
-		result = result[:maxBytes] + "\n<response clipped>"
+		// Back up to a rune boundary so the clip never splits a multi-byte character.
+		cut := maxBytes
+		for i := 0; i < utf8.UTFMax && cut > 0 && !utf8.RuneStart(result[cut]); i++ {
+			cut--
+		}
+		result = result[:cut] + "\n<response clipped>"
 	}
 	return result, nil
 }
@@ -216,25 +289,150 @@ func toDiskEndings(s string, crlf bool) string {
 	return s
 }
 
-// WriteFile creates or overwrites a file with the given content.
-// Incoming content is normalized to LF internally. A new file is written as
-// LF; an existing file keeps its detected line-ending style (CRLF or LF).
+// stripBOM removes a leading UTF-8 BOM and reports whether there was one.
+func stripBOM(data []byte) ([]byte, bool) {
+	if bytes.HasPrefix(data, utf8BOM) {
+		return data[len(utf8BOM):], true
+	}
+	return data, false
+}
+
+// isBinaryOrUTF16 reports whether data must not be edited as text: it starts
+// with a UTF-16 BOM or has a NUL byte within its first binarySniffLen bytes.
+func isBinaryOrUTF16(data []byte) bool {
+	if bytes.HasPrefix(data, []byte{0xFF, 0xFE}) || bytes.HasPrefix(data, []byte{0xFE, 0xFF}) {
+		return true
+	}
+	head := data
+	if len(head) > binarySniffLen {
+		head = head[:binarySniffLen]
+	}
+	return bytes.IndexByte(head, 0) >= 0
+}
+
+// withBOM prepends a UTF-8 BOM to s when the original file had one, unless s
+// already starts with U+FEFF (so it is never doubled).
+func withBOM(s string, hadBOM bool) string {
+	if hadBOM && !strings.HasPrefix(s, "\uFEFF") {
+		return "\uFEFF" + s
+	}
+	return s
+}
+
+// resolveWriteTarget returns the file an atomic write must replace. If path is
+// a symlink the resolved target is returned so the link itself survives. The
+// result is used only to pick the write destination, never to reject a path.
+func resolveWriteTarget(path string) string {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			return resolved
+		}
+	}
+	return path
+}
+
+// atomicWriteFile replaces dest with data without ever leaving a partially
+// written file: the data is written and fsynced to a temp file in the same
+// directory, the original permission bits are copied onto it (0644 for a new
+// file), and it is renamed over dest. On any failure the temp file is removed
+// and the original is untouched. If dest is a symlink, its target is replaced.
+func atomicWriteFile(dest string, data []byte) (err error) {
+	target := resolveWriteTarget(dest)
+	mode := os.FileMode(0644)
+	if info, statErr := os.Stat(target); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+
+	base := filepath.Base(target)
+	if len(base) > 100 {
+		base = base[:100] // keep the temp name well under file-name limits
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(target), "."+base+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("syncing temp file: %w", err)
+	}
+	if err = tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("setting file mode: %w", err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+	if err = renameWithRetry(tmpName, target); err != nil {
+		return fmt.Errorf("replacing file: %w", err)
+	}
+	return nil
+}
+
+// renameWithRetry renames oldpath over newpath. On Windows a rename can fail
+// transiently (sharing violation / access denied) while an editor or virus
+// scanner briefly has the destination open, so a few short retries are made.
+func renameWithRetry(oldpath, newpath string) error {
+	attempts := 1
+	if runtime.GOOS == "windows" {
+		attempts = 5
+	}
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = renameFile(oldpath, newpath); err == nil {
+			return nil
+		}
+		if i < attempts-1 {
+			time.Sleep(time.Duration(10*(i+1)) * time.Millisecond)
+		}
+	}
+	return err
+}
+
+// WriteFile creates or overwrites a file with the given content. See Create.
 func (f *FileOps) WriteFile(path, content string) error {
+	_, err := f.Create(path, content)
+	return err
+}
+
+// Create creates or overwrites a file with the given content and reports
+// whether an existing file was overwritten. Incoming content is normalized to
+// LF internally. A new file is written as LF with no BOM; an existing file
+// keeps its detected line-ending style (CRLF or LF) and its UTF-8 BOM, and
+// content is written exactly as given otherwise (including its own final
+// newline state).
+func (f *FileOps) Create(path, content string) (overwritten bool, err error) {
 	clean, err := f.guardPath(path)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer f.lockPath(clean)()
 
 	if err := os.MkdirAll(filepath.Dir(clean), 0755); err != nil {
-		return fmt.Errorf("creating parent directories: %w", err)
+		return false, fmt.Errorf("creating parent directories: %w", err)
 	}
 	content = strings.ReplaceAll(content, "\r\n", "\n")
-	crlf := false
+	crlf, hadBOM := false, false
 	if existing, err := os.ReadFile(clean); err == nil {
+		overwritten = true
 		crlf = detectLineEnding(existing)
+		_, hadBOM = stripBOM(existing)
 	}
-	return os.WriteFile(clean, []byte(toDiskEndings(content, crlf)), 0644)
+	out := withBOM(toDiskEndings(content, crlf), hadBOM)
+	if err := atomicWriteFile(clean, []byte(out)); err != nil {
+		return false, err
+	}
+	return overwritten, nil
 }
 
 // StrReplace replaces exactly one unique occurrence of oldStr with newStr.
@@ -243,15 +441,22 @@ func (f *FileOps) StrReplace(path, oldStr, newStr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if oldStr == "" {
+		return "", fmt.Errorf("old_str must not be empty")
+	}
 	defer f.lockPath(clean)()
 
 	data, err := os.ReadFile(clean)
 	if err != nil {
 		return "", fmt.Errorf("file not found: %s", path)
 	}
+	if isBinaryOrUTF16(data) {
+		return "", errors.New(errBinaryEdit)
+	}
+	body, hadBOM := stripBOM(data)
 	// Normalize CRLF in the file and in both operands so matches succeed
 	// regardless of whether the LLM or the file uses CRLF or LF.
-	content := strings.ReplaceAll(string(data), "\r\n", "\n")
+	content := strings.ReplaceAll(string(body), "\r\n", "\n")
 	oldStr = strings.ReplaceAll(oldStr, "\r\n", "\n")
 	newStr = strings.ReplaceAll(newStr, "\r\n", "\n")
 	count := strings.Count(content, oldStr)
@@ -262,7 +467,8 @@ func (f *FileOps) StrReplace(path, oldStr, newStr string) (string, error) {
 		return "", fmt.Errorf("found %d occurrences of the specified text — must be unique", count)
 	}
 	result := strings.Replace(content, oldStr, newStr, 1)
-	if err := os.WriteFile(clean, []byte(toDiskEndings(result, detectLineEnding(data))), 0644); err != nil {
+	out := withBOM(toDiskEndings(result, detectLineEnding(data)), hadBOM)
+	if err := atomicWriteFile(clean, []byte(out)); err != nil {
 		return "", fmt.Errorf("writing file: %w", err)
 	}
 	return "Successfully replaced text at exactly one location.", nil
@@ -280,9 +486,13 @@ func (f *FileOps) Insert(path string, lineNum int, newStr string) (string, error
 	if err != nil {
 		return "", fmt.Errorf("file not found: %s", path)
 	}
+	if isBinaryOrUTF16(data) {
+		return "", errors.New(errBinaryEdit)
+	}
+	body, hadBOM := stripBOM(data)
 
 	// Normalize CRLF before splitting so inserted content aligns correctly.
-	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	lines := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n")
 	if lineNum < 0 || lineNum > len(lines) {
 		return "", fmt.Errorf("invalid line number %d (file has %d lines)", lineNum, len(lines))
 	}
@@ -298,8 +508,8 @@ func (f *FileOps) Insert(path string, lineNum int, newStr string) (string, error
 	newLines = append(newLines, text)
 	newLines = append(newLines, lines[lineNum:]...)
 
-	result := toDiskEndings(strings.Join(newLines, "\n"), detectLineEnding(data))
-	if err := os.WriteFile(clean, []byte(result), 0644); err != nil {
+	out := withBOM(toDiskEndings(strings.Join(newLines, "\n"), detectLineEnding(data)), hadBOM)
+	if err := atomicWriteFile(clean, []byte(out)); err != nil {
 		return "", fmt.Errorf("writing file: %w", err)
 	}
 	return fmt.Sprintf("Successfully inserted text after line %d.", lineNum), nil

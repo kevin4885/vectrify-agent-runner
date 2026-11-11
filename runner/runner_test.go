@@ -2,6 +2,8 @@ package runner
 
 import (
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -189,5 +191,34 @@ func TestHandleBrowser_EvaluateReadsScriptField(t *testing.T) {
 	}
 	if containsSubstring(result.Error, "script is required") {
 		t.Fatalf("handleBrowser rejected a script that was actually supplied -- field name mismatch: %q", result.Error)
+	}
+}
+
+// TestHandleFileOp_CreateMessages verifies create reports a new file with the
+// path and an overwrite of an existing file with the fixed overwrite message.
+func TestHandleFileOp_CreateMessages(t *testing.T) {
+	r := newTestRunner(t, false)
+	p := filepath.Join(r.workspaceRoot, "doc.txt")
+
+	run := func(content string) protocol.ResultMsg {
+		c := &collectSends{}
+		r.handleFileOp("cmd1", protocol.RawCommand{"command": "create", "path": p, "file_text": content}, c.send)
+		res, ok := c.lastResult()
+		if !ok {
+			t.Fatal("expected a ResultMsg, got none")
+		}
+		return res
+	}
+
+	first := run("one\n")
+	if !first.OK || first.Data != "File created successfully: "+p {
+		t.Errorf("new file: OK=%v Data=%q", first.OK, first.Data)
+	}
+	second := run("two\n")
+	if !second.OK || second.Data != "File overwritten successfully" {
+		t.Errorf("existing file: OK=%v Data=%q", second.OK, second.Data)
+	}
+	if got, _ := os.ReadFile(p); string(got) != "two\n" {
+		t.Errorf("file content: %q", got)
 	}
 }

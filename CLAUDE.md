@@ -49,7 +49,7 @@ vectrify-agent-runner/
 ├── client/
 │   └── ws_client.go       WebSocket connection, registration handshake, reconnect with backoff
 ├── executor/
-│   ├── file_ops.go        File CRUD — read (with line numbers), write, str_replace, insert, delete. Edits keep each existing file's CRLF/LF style (majority; tie/empty/new file = LF) and its final-newline state
+│   ├── file_ops.go        File CRUD — read (with line numbers), write, str_replace, insert, delete. Edits keep each existing file's CRLF/LF style (majority; tie/empty/new file = LF) and its final-newline state (create over an existing file writes the given text as-is in that style); a UTF-8 BOM is kept; writes are atomic (temp file + fsync + rename, symlink targets written through, permissions kept); str_replace/insert refuse binary/UTF-16 files; paths must be absolute (workspace check is case-insensitive on Windows); per-path locks are ref-counted and released
 │   ├── file_transfer.go   File transfer via presigned S3 URLs (download runner←S3, upload runner→S3)
 │   ├── shell.go           Shell execution (bash/PowerShell) + structured git operations
 │   ├── shell_launch.go    Single launcher for shell.go AND process.go: bash -c, or (Windows) a constant
