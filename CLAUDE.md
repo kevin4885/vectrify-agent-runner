@@ -434,9 +434,19 @@ for how this is described to the LLM.
 - **Preamble also:** forces UTF-8 console I/O; defaults `Get-Content` / `Select-String` to
   `-Encoding UTF8` (BOM-less files no longer turn em dashes into mojibake; an explicit
   `-Encoding` still wins; write-side defaults are deliberately untouched because PS 5.1
-  `UTF8` writes a BOM); and replaces `Set-/Push-/Pop-Location` with `ProxyCommand`-generated
+  `UTF8` writes a BOM); replaces `Set-/Push-/Pop-Location` with `ProxyCommand`-generated
   proxies that also set `[Environment]::CurrentDirectory`, so relative `[IO.File]::*` paths
-  follow `cd`.
+  follow `cd`; and widens the host buffer to 4096x3000 (`winHostWidth`, try/catch-guarded).
+  The redirected host otherwise reports 99 columns and hard-wraps `Select-String` matches,
+  `Format-Table` and error records.
+- **Parse errors:** only the `[scriptblock]::Create(...)` call is in a `try/catch`. On a
+  syntax error nothing of the user's command runs; the catch writes just the inner parser
+  message (positions relative to the submitted command, `At line:1` = its first line) to
+  stderr and exits 1. Runtime errors are not caught and behave as before.
+- **Child environment:** `shellEnv()` (used by both `Shell.Run` and `ProcessManager.Start`)
+  = the runner's environment + `NO_COLOR=1` unless `NO_COLOR` is already defined (any case,
+  even empty — the user's value wins). `FORCE_COLOR` is never set (some tools treat any
+  value as "force colour on"). Any new `exec.Cmd` for a shell child must use it too.
 - Windows PowerShell 5.1 only. If `pwsh` support is ever added, re-verify the bootstrap.
 
 ## Building
